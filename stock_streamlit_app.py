@@ -5,6 +5,7 @@ import streamlit as st
 from stock_info_news import (
     disable_broken_proxy_env,
     enrich_company_profile,
+    get_krx_fundamentals_and_flow,
     get_related_stocks,
     get_recent_news,
     get_stock_snapshot,
@@ -102,6 +103,26 @@ st.markdown(
       box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
       height: 100%;
     }
+    div[data-testid="metric-container"] {
+      background: #ffffff;
+      border: 1px solid #dbe4f0;
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+    }
+    div[data-testid="metric-container"] > label {
+      color: #475569 !important;
+      font-weight: 600 !important;
+    }
+    div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+      color: #0f172a;
+      font-weight: 800;
+    }
+    div[data-testid="stDataFrame"] {
+      border: 1px solid #dbe4f0;
+      border-radius: 12px;
+      overflow: hidden;
+    }
     .kpi-label { color: var(--muted); font-size: 0.85rem; }
     .kpi-value { color: var(--ink); font-weight: 700; font-size: 1.25rem; margin-top: 4px; }
     .news-item {
@@ -111,16 +132,25 @@ st.markdown(
       padding: 12px 14px;
       margin-bottom: 10px;
     }
+    .section-card {
+      background: #ffffff;
+      border: 1px solid #dbe4f0;
+      border-radius: 16px;
+      padding: 14px 16px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+      margin-bottom: 14px;
+    }
     .news-meta { color: var(--muted); font-size: 0.85rem; }
     .rel-card {
       background: #ffffff;
       border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px 10px;
-      margin-bottom: 8px;
+      border-radius: 14px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
     }
     .rel-name { font-weight: 600; color: var(--ink); margin-right:8px; }
-    .rel-row { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; overflow:hidden; }
+    .rel-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
     .rel-sub { color: var(--muted); font-size: 0.82rem; white-space: nowrap; }
     .score-wrap { display:flex; align-items:center; gap:6px; margin-left:auto; }
     .score-row { display:flex; align-items:center; gap:4px; }
@@ -131,6 +161,10 @@ st.markdown(
     .score-bar-theme { height:100%; background:linear-gradient(90deg,#0ea5e9,#0369a1); }
     .score-bar-text { height:100%; background:linear-gradient(90deg,#22c55e,#15803d); }
     .score-num { width:28px; text-align:right; font-size:0.7rem; color:var(--muted); }
+    @media (max-width: 900px) {
+      .rel-sub { white-space: normal; }
+      .score-wrap { width: 100%; margin-left: 0; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -202,18 +236,46 @@ if effective_run or st.session_state.get("last_match"):
                 if description == "회사 설명 정보가 없습니다.":
                     description = "정보 없음"
 
-                st.markdown("### 회사 기본정보")
-                profile_line = build_company_profile_line(
-                    match["name"],
-                    industry,
-                    products,
-                    description if description != "정보 없음" else "",
-                )
-                st.write(f"- 업종(상세): {profile_line}")
-                if market_dept != "N/A":
-                    st.write(f"- 시장 소속부: {market_dept}")
-                st.write(f"- 주요 제품/사업: {products}")
-                st.write(description)
+                with st.container(border=True):
+                    st.markdown("### 회사 기본정보")
+                    profile_line = build_company_profile_line(
+                        match["name"],
+                        industry,
+                        products,
+                        description if description != "정보 없음" else "",
+                    )
+                    st.write(f"- 업종(상세): {profile_line}")
+                    if market_dept != "N/A":
+                        st.write(f"- 시장 소속부: {market_dept}")
+                    st.write(f"- 주요 제품/사업: {products}")
+                    st.write(description)
+
+                if match.get("market_type") == "KRX":
+                    with st.container(border=True):
+                        st.markdown("### 최근 재무 / 수급")
+                        extra = get_krx_fundamentals_and_flow(match["symbol"])
+                        f = extra.get("fundamental", {}) if isinstance(extra, dict) else {}
+                        flow = extra.get("flow", {}) if isinstance(extra, dict) else {}
+                        flow_table = extra.get("flow_table", []) if isinstance(extra, dict) else []
+                        flow_error = extra.get("error") if isinstance(extra, dict) else None
+
+                        cfa, cfb, cfc = st.columns(3)
+                        cfa.metric("PER", fmt_num(f.get("PER"), ",.2f"))
+                        cfb.metric("PBR", fmt_num(f.get("PBR"), ",.2f"))
+                        cfc.metric("EPS", fmt_num(f.get("EPS"), ",.0f"))
+
+                        cfd, cfe = st.columns(2)
+                        cfd.metric("기관 5일 수급(주수합계)", fmt_num(flow.get("inst_5d"), ",.0f"))
+                        cfe.metric("외인 5일 수급(주수합계)", fmt_num(flow.get("foreign_5d"), ",.0f"))
+
+                        if flow_table:
+                            st.dataframe(flow_table, use_container_width=True)
+                        else:
+                            if flow_error:
+                                st.warning("수급 데이터를 불러오지 못했습니다. 현재 네트워크/프록시 설정으로 KRX 접속이 차단된 상태일 수 있습니다.")
+                                st.caption(f"상세 오류: {flow_error}")
+                            else:
+                                st.caption("수급 데이터가 아직 제공되지 않았습니다.")
 
                 st.markdown("### 같은 테마 종목")
                 related = get_related_stocks(match, limit=8)
@@ -235,6 +297,9 @@ if effective_run or st.session_state.get("last_match"):
                         theme_pct = int((theme_score / 5) * 100)
                         keyword_pct = int((keyword_score / 5) * 100)
                         product_industry = item.get("products") or item.get("industry", "N/A")
+                        keyword_text = item.get("matched_keywords", "").strip()
+                        if not keyword_text:
+                            keyword_text = "뉴스동시언급 기반"
 
                         c_left.markdown(
                             f"""
@@ -243,7 +308,7 @@ if effective_run or st.session_state.get("last_match"):
                                 <div class="rel-name">{item['name']} ({item['symbol']})</div>
                                 <div class="rel-sub">주요제품/산업: {product_industry}</div>
                                 <div class="rel-sub">테마: {item.get('matched_themes', '')}</div>
-                                <div class="rel-sub">키워드: {item.get('matched_keywords', '없음')}</div>
+                                <div class="rel-sub">키워드: {keyword_text}</div>
                                 <div class="score-wrap">
                                   <div class="score-row">
                                     <div class="score-label">테마</div>

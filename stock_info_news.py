@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import tempfile
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,7 @@ GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 WIKIPEDIA_API_KO = "https://ko.wikipedia.org/api/rest_v1/page/summary/"
 WIKIPEDIA_API_EN = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 THEME_MAP_PATH = "krx_theme_map.json"
+THEME_ONTOLOGY_PATH = "theme_ontology.json"
 AUTO_THEME_RULES: Dict[str, List[str]] = {
     "2차전지": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "셀"],
     "반도체": ["반도체", "메모리", "파운드리", "후공정", "전공정", "칩", "웨이퍼"],
@@ -417,6 +419,42 @@ def extract_theme_keyword_hits(text: str) -> Dict[str, set]:
     return hits
 
 
+@lru_cache(maxsize=1)
+def load_theme_ontology() -> Dict[str, Any]:
+    try:
+        with open(THEME_ONTOLOGY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"themes": []}
+
+
+def extract_ontology_hits(text: str) -> Dict[str, set]:
+    lowered = to_text(text).lower()
+    out: Dict[str, set] = {}
+    for t in load_theme_ontology().get("themes", []):
+        name = to_text(t.get("name"))
+        kws = [to_text(x).lower() for x in t.get("core_keywords", [])]
+        hits = {k for k in kws if k and k in lowered}
+        if hits:
+            out[name] = hits
+    return out
+
+
+def infer_theme_groups_from_ontology(themes: List[str]) -> set:
+    groups = set()
+    theme_set = set(themes)
+    for t in load_theme_ontology().get("themes", []):
+        name = to_text(t.get("name"))
+        if name in theme_set:
+            g = to_text(t.get("group"))
+            if g:
+                groups.add(g)
+    return groups
+
+
 def infer_theme_groups(themes: List[str]) -> set:
     groups = set()
     for t in themes:
@@ -488,8 +526,17 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
     )
     base_auto_themes = set(infer_themes_from_text(base_text))
     base_theme_hits = extract_theme_keyword_hits(base_text)
-    base_themes = set(theme_map.get(symbol, [])) | base_auto_themes
-    base_groups = infer_theme_groups(list(base_themes))
+    base_ontology_hits = extract_ontology_hits(base_text)
+    news_query = to_text(match.get("name")) or symbol
+    news_themes_info = infer_themes_from_news(news_query, limit=12)
+    base_news_titles = get_news_titles_multi(
+        [news_query, f"{news_query} 유리기판", f"{news_query} 관련주"],
+        limit_each=10,
+    )
+    news_themes = set(news_themes_info.get("themes", set()))
+    news_hits = news_themes_info.get("hits", {})
+    base_themes = set(theme_map.get(symbol, [])) | base_auto_themes | news_themes | set(base_ontology_hits.keys())
+    base_groups = infer_theme_groups(list(base_themes)) | infer_theme_groups_from_ontology(list(base_themes))
 
     if base_themes:
         base_tokens = set(
@@ -526,11 +573,26 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             candidate_product_industry_text = " ".join([to_text(industry), to_text(products)])
             auto_themes = set(infer_themes_from_text(" ".join([name, industry, products, sector])))
             cand_theme_hits = extract_theme_keyword_hits(candidate_product_industry_text)
-            overlap = sorted(base_themes.intersection(themes | auto_themes))
-            if not overlap:
+            cand_ontology_hits = extract_ontology_hits(candidate_product_industry_text)
+            overlap = sorted(base_themes.intersection(themes | auto_themes | set(cand_ontology_hits.keys())))
+            co_mention_score = 0
+            for title in base_news_titles:
+                tline = to_text(title)
+                if not tline:
+                    continue
+                if len(to_text(name).strip()) < 3:
+                    continue
+                if name and name in tline:
+                    co_mention_score += 1
+
+            if not overlap and co_mention_score < 1:
                 continue
-            cand_groups = infer_theme_groups(list(themes | auto_themes))
-            if base_groups and cand_groups and base_groups.isdisjoint(cand_groups):
+            if not overlap and co_mention_score >= 1:
+                overlap = ["뉴스동시언급"]
+            cand_groups = infer_theme_groups(list(themes | auto_themes)) | infer_theme_groups_from_ontology(
+                list(set(cand_ontology_hits.keys()) | themes | auto_themes)
+            )
+            if base_groups and cand_groups and base_groups.isdisjoint(cand_groups) and co_mention_score < 1:
                 continue
             cand_tokens = set(
                 tokenize_kr_text(" ".join([to_text(name), to_text(industry), to_text(products), to_text(sector)]))
@@ -539,19 +601,33 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             keyword_overlap_count = 0
             matched_keywords: List[str] = []
             for t in overlap:
-                base_kw = base_theme_hits.get(t, set())
+                base_kw = set(base_theme_hits.get(t, set())).union(news_hits.get(t, set()))
                 cand_kw = cand_theme_hits.get(t, set())
+                base_kw = base_kw.union(base_ontology_hits.get(t, set()))
+                cand_kw = cand_kw.union(cand_ontology_hits.get(t, set()))
                 inter = sorted(base_kw.intersection(cand_kw))
                 if inter:
                     keyword_overlap_count += len(inter)
                     matched_keywords.extend([f"{t}:{k}" for k in inter])
 
-            # Strict filter: require at least one concrete business keyword overlap.
-            if keyword_overlap_count < 1:
+            # Strict filter:
+            # 1) Prefer concrete business-keyword overlap.
+            # 2) If only co-mention is present, require at least weak textual overlap
+            #    to avoid broad-market names creating noisy links.
+            if keyword_overlap_count < 1 and co_mention_score < 1:
+                continue
+            if keyword_overlap_count < 1 and co_mention_score >= 1 and text_overlap < 2:
                 continue
 
-            # prioritize concrete product/industry keyword matches
-            total_score = (len(overlap) * 12) + (keyword_overlap_count * 10) + text_overlap
+            # prioritize concrete product/industry keyword matches + ontology overlaps
+            ontology_overlap_count = len(set(overlap).intersection(set(cand_ontology_hits.keys())))
+            total_score = (
+                (len(overlap) * 10)
+                + (keyword_overlap_count * 10)
+                + (ontology_overlap_count * 8)
+                + (co_mention_score * 12)
+                + text_overlap
+            )
             scored.append({
                 "symbol": code,
                 "name": name,
@@ -561,12 +637,16 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
                 "theme_score": len(overlap),
                 "keyword_score": keyword_overlap_count,
                 "text_score": text_overlap,
+                "ontology_score": ontology_overlap_count,
+                "co_mention_score": co_mention_score,
                 "matched_keywords": ", ".join(matched_keywords[:6]),
                 "score": total_score,
             })
         scored.sort(
             key=lambda x: (
                 -x["score"],
+                -x["co_mention_score"],
+                -x["ontology_score"],
                 -x["keyword_score"],
                 -x["theme_score"],
                 -x["text_score"],
@@ -605,6 +685,277 @@ def get_recent_news(query: str, limit: int = 5) -> List[Dict[str, str]]:
     r.raise_for_status()
     feed = feedparser.parse(r.text)
     return [{"title": e.get("title", "제목 없음"), "link": e.get("link", ""), "published": e.get("published", "")} for e in feed.entries[:limit]]
+
+
+def infer_themes_from_news(query: str, limit: int = 12) -> Dict[str, Any]:
+    try:
+        items = get_recent_news(query, limit=limit)
+    except Exception:
+        return {"themes": set(), "hits": {}}
+
+    titles = " ".join([to_text(x.get("title", "")) for x in items])
+    themes = set(infer_themes_from_text(titles))
+    hits = extract_theme_keyword_hits(titles)
+    return {"themes": themes, "hits": hits}
+
+
+def get_news_titles(query: str, limit: int = 20) -> List[str]:
+    try:
+        items = get_recent_news(query, limit=limit)
+        return [to_text(x.get("title", "")) for x in items]
+    except Exception:
+        return []
+
+
+def get_news_titles_multi(queries: List[str], limit_each: int = 10) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for q in queries:
+        for title in get_news_titles(q, limit=limit_each):
+            t = to_text(title).strip()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def get_krx_fundamentals_and_flow(symbol: str) -> Dict[str, Any]:
+    """KRX용 최근 재무지표/수급 요약. pykrx 미설치 또는 조회 실패 시 빈값 반환."""
+    result: Dict[str, Any] = {
+        "fundamental": {},
+        "flow": {},
+        "flow_table": [],
+        "error": None,
+    }
+    # pykrx import 시 matplotlib 캐시 경로 권한 이슈 방지
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+
+    try:
+        from pykrx import stock  # type: ignore
+    except Exception:
+        stock = None  # type: ignore
+
+    now = dt.datetime.now()
+    today = now.strftime("%Y%m%d")
+    start_60 = (now - dt.timedelta(days=60)).strftime("%Y%m%d")
+    start_20 = (now - dt.timedelta(days=20)).strftime("%Y%m%d")
+
+    if stock is not None:
+        def _pick_val(obj: Any, keys: List[str]) -> Optional[float]:
+            for k in keys:
+                if k in obj and pd.notna(obj[k]):
+                    try:
+                        return float(obj[k])
+                    except Exception:
+                        continue
+            return None
+
+        def _find_recent_business_day(sym: str, back_days: int = 14) -> Optional[str]:
+            for i in range(back_days + 1):
+                d = (now - dt.timedelta(days=i)).strftime("%Y%m%d")
+                try:
+                    chk = stock.get_market_fundamental_by_date(d, d, sym)
+                    if chk is not None and not chk.empty:
+                        return d
+                except Exception:
+                    continue
+            return None
+
+        end_day = _find_recent_business_day(symbol) or today
+        start_60 = (dt.datetime.strptime(end_day, "%Y%m%d") - dt.timedelta(days=60)).strftime("%Y%m%d")
+        start_20 = (dt.datetime.strptime(end_day, "%Y%m%d") - dt.timedelta(days=20)).strftime("%Y%m%d")
+
+        try:
+            f = stock.get_market_fundamental_by_date(start_60, end_day, symbol)
+            if not f.empty:
+                last = f.iloc[-1]
+                result["fundamental"] = {
+                    "BPS": _pick_val(last, ["BPS", "bps", "주당순자산가치"]),
+                    "PER": _pick_val(last, ["PER", "per"]),
+                    "PBR": _pick_val(last, ["PBR", "pbr"]),
+                    "EPS": _pick_val(last, ["EPS", "eps", "주당순이익"]),
+                    "DIV": _pick_val(last, ["DIV", "div", "배당수익률"]),
+                    "DPS": _pick_val(last, ["DPS", "dps", "주당배당금"]),
+                }
+            else:
+                if not result.get("error"):
+                    result["error"] = "KRX 재무 데이터가 비어 있습니다."
+        except Exception as e:
+            msg = str(e)
+            if "None of [Index(['BPS', 'PER', 'PBR', 'EPS', 'DIV', 'DPS']" in msg:
+                result["error"] = "KRX 재무 데이터 포맷이 변경되어 재무 지표를 가져오지 못했습니다."
+            else:
+                result["error"] = msg
+
+        try:
+            t = stock.get_market_trading_value_by_date(start_20, end_day, symbol)
+            if not t.empty:
+                cols = [c for c in ["기관합계", "외국인합계"] if c in t.columns]
+                if cols:
+                    recent = t[cols].tail(5).copy()
+                    flow_table = []
+                    for idx, row in recent.iterrows():
+                        flow_table.append(
+                            {
+                                "date": str(idx.date()) if hasattr(idx, "date") else str(idx),
+                                "institution": float(row["기관합계"]) if "기관합계" in row else 0.0,
+                                "foreign": float(row["외국인합계"]) if "외국인합계" in row else 0.0,
+                            }
+                        )
+                    result["flow_table"] = flow_table
+
+                    inst_5d = float(recent["기관합계"].sum()) if "기관합계" in recent else 0.0
+                    for_5d = float(recent["외국인합계"].sum()) if "외국인합계" in recent else 0.0
+                    result["flow"] = {
+                        "inst_5d": inst_5d,
+                        "foreign_5d": for_5d,
+                    }
+            else:
+                # fallback 2: 투자자별 거래대금 API로 재시도
+                try:
+                    investors = ["기관합계", "외국인", "외국인합계"]
+                    rows: List[Dict[str, Any]] = []
+                    for inv in investors:
+                        try:
+                            iv = stock.get_market_trading_value_by_investor(
+                                start_20, end_day, symbol, inv
+                            )
+                            if iv is not None and not iv.empty:
+                                rows.append({"inv": inv, "df": iv})
+                        except Exception:
+                            continue
+                    if rows:
+                        base = rows[0]["df"].copy()
+                        base_cols = {}
+                        for r in rows:
+                            df_inv = r["df"]
+                            col_name = "institution" if "기관" in r["inv"] else "foreign"
+                            val_col = "순매수" if "순매수" in df_inv.columns else (
+                                df_inv.columns[0] if len(df_inv.columns) > 0 else None
+                            )
+                            if val_col is None:
+                                continue
+                            base_cols[col_name] = df_inv[val_col]
+                        if base_cols:
+                            recent_df = pd.DataFrame(base_cols).tail(5).fillna(0.0)
+                            flow_table = []
+                            for idx, row in recent_df.iterrows():
+                                flow_table.append(
+                                    {
+                                        "date": str(idx.date()) if hasattr(idx, "date") else str(idx),
+                                        "institution": float(row.get("institution", 0.0)),
+                                        "foreign": float(row.get("foreign", 0.0)),
+                                    }
+                                )
+                            result["flow_table"] = flow_table
+                            result["flow"] = {
+                                "inst_5d": float(recent_df.get("institution", pd.Series(dtype=float)).sum()),
+                                "foreign_5d": float(recent_df.get("foreign", pd.Series(dtype=float)).sum()),
+                            }
+                    elif not result.get("error"):
+                        result["error"] = "KRX 수급 데이터가 비어 있습니다."
+                except Exception as e2:
+                    if not result.get("error"):
+                        result["error"] = f"KRX 수급 fallback 실패: {e2}"
+        except Exception as e:
+            if not result.get("error"):
+                result["error"] = str(e)
+
+    # pykrx 실패/공란 시 KRX 티커(.KS/.KQ) 대상으로 Yahoo fallback
+    if not result.get("fundamental"):
+        for suffix in [".KS", ".KQ"]:
+            try:
+                info = yf.Ticker(f"{symbol}{suffix}").info or {}
+                per = info.get("trailingPE")
+                pbr = info.get("priceToBook")
+                eps = info.get("trailingEps")
+                if per is None and pbr is None and eps is None:
+                    continue
+                result["fundamental"] = {
+                    "PER": float(per) if per is not None else None,
+                    "PBR": float(pbr) if pbr is not None else None,
+                    "EPS": float(eps) if eps is not None else None,
+                }
+                if not result.get("error"):
+                    result["error"] = "KRX 원본 실패로 Yahoo 재무 fallback 사용 중(수급은 KRX 필요)."
+                break
+            except Exception:
+                continue
+
+    if not result.get("fundamental") and not result.get("flow_table") and not result.get("error"):
+        result["error"] = "재무/수급 데이터 소스에서 유효 데이터를 받지 못했습니다."
+
+    # 최종 fallback: 네이버 증권 HTML 파싱
+    if not result.get("fundamental") or not result.get("flow_table"):
+        try:
+            disable_broken_proxy_env()
+            naver_url = f"https://finance.naver.com/item/main.naver?code={symbol}"
+            tables = pd.read_html(naver_url)
+
+            if not result.get("flow_table"):
+                for df in tables:
+                    cols = [str(c) for c in df.columns]
+                    if all(x in cols for x in ["날짜", "외국인", "기관"]):
+                        tmp = df.copy()
+                        tmp = tmp.dropna(subset=["날짜"])
+                        if tmp.empty:
+                            continue
+                        tmp["외국인"] = pd.to_numeric(tmp["외국인"], errors="coerce")
+                        tmp["기관"] = pd.to_numeric(tmp["기관"], errors="coerce")
+                        tmp = tmp.dropna(subset=["외국인", "기관"]).head(5)
+                        if tmp.empty:
+                            continue
+                        flow_table = []
+                        for _, row in tmp.iterrows():
+                            flow_table.append(
+                                {
+                                    "date": str(row["날짜"]),
+                                    "institution": float(row["기관"]),
+                                    "foreign": float(row["외국인"]),
+                                }
+                            )
+                        result["flow_table"] = flow_table
+                        result["flow"] = {
+                            "inst_5d": float(tmp["기관"].sum()),
+                            "foreign_5d": float(tmp["외국인"].sum()),
+                        }
+                        if result.get("error"):
+                            result["error"] = "KRX 수급 실패로 네이버 수급 fallback 사용 중"
+                        break
+
+            if not result.get("fundamental"):
+                for df in tables:
+                    if len(df.columns) < 2:
+                        continue
+                    first_col = str(df.columns[0])
+                    if "주요재무정보" not in first_col:
+                        continue
+                    dfx = df.copy()
+                    dfx.columns = ["__item__"] + [f"c{i}" for i in range(1, len(dfx.columns))]
+                    dfx["__item__"] = dfx["__item__"].astype(str)
+
+                    def _extract_metric(name_prefix: str) -> Optional[float]:
+                        rows = dfx[dfx["__item__"].str.startswith(name_prefix)]
+                        if rows.empty:
+                            return None
+                        vals = pd.to_numeric(rows.iloc[0, 1:], errors="coerce").dropna()
+                        if vals.empty:
+                            return None
+                        return float(vals.iloc[-1])
+
+                    per = _extract_metric("PER")
+                    pbr = _extract_metric("PBR")
+                    eps = _extract_metric("EPS")
+                    if per is not None or pbr is not None or eps is not None:
+                        result["fundamental"] = {"PER": per, "PBR": pbr, "EPS": eps}
+                        if result.get("error"):
+                            result["error"] = "KRX 재무 실패로 네이버 재무 fallback 사용 중"
+                        break
+        except Exception:
+            pass
+
+    return result
 
 
 def main() -> None:
