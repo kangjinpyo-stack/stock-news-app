@@ -32,6 +32,43 @@ if st.session_state.get("pending_query"):
 
 st.set_page_config(page_title="KRX Stock Pulse", page_icon="📊", layout="wide")
 
+
+def first_sentence(text: str, limit: int = 170) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    for sep in ("다.", ". ", ".\n"):
+        idx = t.find(sep)
+        if idx != -1:
+            t = t[: idx + 1]
+            break
+    if len(t) > limit:
+        t = t[:limit].rstrip() + "..."
+    return t
+
+
+def build_company_profile_line(name: str, industry: str, products: str, desc: str) -> str:
+    chunks = []
+    if industry and industry != "N/A":
+        chunks.append(industry)
+    if products and products != "N/A":
+        chunks.append(f"주요 제품/사업: {products}")
+    summary = first_sentence(desc)
+    if summary:
+        chunks.append(summary)
+    if not chunks:
+        return f"{name}의 상세 업종 정보가 부족합니다."
+    return " | ".join(chunks)
+
+
+def fmt_num(value, pattern: str = ",.2f") -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return format(float(value), pattern)
+    except Exception:
+        return "N/A"
+
 st.markdown(
     """
     <style>
@@ -150,21 +187,31 @@ if effective_run or st.session_state.get("last_match"):
                 st.subheader(f"{match['name']} ({match['symbol']})")
                 st.caption(f"시장: {match['exchange']} | 통화: {snapshot['currency']}")
 
-                sector = snapshot.get("sector") or match.get("sector") or "N/A"
+                market_dept = match.get("market_dept") or snapshot.get("market_dept") or "N/A"
                 industry = snapshot.get("industry") or match.get("industry") or "N/A"
                 products = snapshot.get("products") or match.get("products") or "N/A"
+                detailed_industry = industry
+                if products and products != "N/A":
+                    detailed_industry = f"{industry} ({products})" if industry != "N/A" else products
                 if match.get("market_type") == "KRX":
                     description = f"{match['name']}은(는) KRX 상장 기업입니다."
-                    if sector != "N/A" or industry != "N/A":
-                        description = f"{match['name']}은(는) {sector} / {industry} 분야 기업입니다."
+                    if detailed_industry != "N/A":
+                        description = f"{match['name']}은(는) {detailed_industry} 분야 기업입니다."
                 else:
                     description = snapshot.get("company_description") or "회사 설명 정보가 없습니다."
                 if description == "회사 설명 정보가 없습니다.":
                     description = "정보 없음"
 
                 st.markdown("### 회사 기본정보")
-                st.write(f"- 업종/섹터: {sector}")
-                st.write(f"- 산업: {industry}")
+                profile_line = build_company_profile_line(
+                    match["name"],
+                    industry,
+                    products,
+                    description if description != "정보 없음" else "",
+                )
+                st.write(f"- 업종(상세): {profile_line}")
+                if market_dept != "N/A":
+                    st.write(f"- 시장 소속부: {market_dept}")
                 st.write(f"- 주요 제품/사업: {products}")
                 st.write(description)
 
@@ -229,7 +276,7 @@ if effective_run or st.session_state.get("last_match"):
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.markdown(
-                    f"<div class='kpi'><div class='kpi-label'>최근 종가</div><div class='kpi-value'>{snapshot['latest_close']:,.2f}</div></div>",
+                    f"<div class='kpi'><div class='kpi-label'>최근 종가</div><div class='kpi-value'>{fmt_num(snapshot.get('latest_close'), ',.2f')}</div></div>",
                     unsafe_allow_html=True,
                 )
                 c2.markdown(
@@ -237,11 +284,11 @@ if effective_run or st.session_state.get("last_match"):
                     unsafe_allow_html=True,
                 )
                 c3.markdown(
-                    f"<div class='kpi'><div class='kpi-label'>거래량</div><div class='kpi-value'>{snapshot['volume']:,.0f}</div></div>",
+                    f"<div class='kpi'><div class='kpi-label'>거래량</div><div class='kpi-value'>{fmt_num(snapshot.get('volume'), ',.0f')}</div></div>",
                     unsafe_allow_html=True,
                 )
                 c4.markdown(
-                    f"<div class='kpi'><div class='kpi-label'>52주 범위</div><div class='kpi-value'>{snapshot['fifty_two_week_low']:,.0f} ~ {snapshot['fifty_two_week_high']:,.0f}</div></div>",
+                    f"<div class='kpi'><div class='kpi-label'>52주 범위</div><div class='kpi-value'>{fmt_num(snapshot.get('fifty_two_week_low'), ',.0f')} ~ {fmt_num(snapshot.get('fifty_two_week_high'), ',.0f')}</div></div>",
                     unsafe_allow_html=True,
                 )
 

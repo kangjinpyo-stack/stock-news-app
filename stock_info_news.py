@@ -19,12 +19,52 @@ AUTO_THEME_RULES: Dict[str, List[str]] = {
     "2차전지": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "셀"],
     "반도체": ["반도체", "메모리", "파운드리", "후공정", "전공정", "칩", "웨이퍼"],
     "AI": ["ai", "인공지능", "llm", "gpu", "데이터센터", "클라우드"],
-    "바이오": ["바이오", "제약", "항체", "의약", "헬스케어", "cdmo", "백신"],
+    "바이오": ["바이오", "제약", "항체", "의약품", "cdmo", "백신", "신약"],
+    "정유화학": ["정유", "석유", "석유화학", "윤활유", "아스팔트", "납사", "정제품"],
     "로봇": ["로봇", "자동화", "협동로봇", "모빌리티"],
     "전력인프라": ["변압기", "전력", "전선", "배전", "송전", "전력기기"],
     "전기차": ["전기차", "ev", "자율주행", "충전"],
     "인터넷플랫폼": ["플랫폼", "포털", "커머스", "메신저", "콘텐츠"],
 }
+
+THEME_EXCLUSIVE_GROUPS: Dict[str, str] = {
+    "2차전지": "battery",
+    "전기차": "battery",
+    "전력인프라": "energy",
+    "반도체": "semiconductor",
+    "AI": "it",
+    "인터넷플랫폼": "it",
+    "바이오": "bio",
+    "정유화학": "energy",
+    "로봇": "robotics",
+}
+GLOBAL_SEED_TICKERS: List[str] = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AMD",
+    "AVGO",
+    "ORCL",
+    "NFLX",
+    "CRM",
+    "INTC",
+    "QCOM",
+    "MU",
+]
+
+# Keep yfinance cache in a writable temp folder across OSes.
+try:
+    import tempfile
+
+    _yf_tmp = os.path.join(tempfile.gettempdir(), "yfinance-cache")
+    os.makedirs(_yf_tmp, exist_ok=True)
+    yf.set_tz_cache_location(_yf_tmp)
+except Exception:
+    pass
 
 
 def to_text(value: Any) -> str:
@@ -36,6 +76,24 @@ def to_text(value: Any) -> str:
     except Exception:
         pass
     return str(value)
+
+
+MARKET_DEPT_LABELS = {
+    "중견기업부",
+    "벤처기업부",
+    "우량기업부",
+    "기술성장기업부",
+    "일반기업부",
+}
+
+
+def normalize_sector_for_display(sector: Any) -> Dict[str, str]:
+    sector_text = to_text(sector).strip()
+    if not sector_text:
+        return {"sector": "", "market_dept": ""}
+    if sector_text in MARKET_DEPT_LABELS:
+        return {"sector": "", "market_dept": sector_text}
+    return {"sector": sector_text, "market_dept": ""}
 
 
 def disable_broken_proxy_env() -> None:
@@ -137,7 +195,8 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
                     "name": profile.get("name") or row.get("Name", symbol),
                     "exchange": str(row.get("Market", "N/A")),
                     "market_type": "KRX",
-                    "sector": profile.get("sector"),
+                    "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
+                    "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
                     "industry": profile.get("industry"),
                     "products": profile.get("products"),
                 }
@@ -148,7 +207,8 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
             "name": profile.get("name") or symbol,
             "exchange": "KRX",
             "market_type": "KRX",
-            "sector": profile.get("sector"),
+            "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
+            "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
             "industry": profile.get("industry"),
             "products": profile.get("products"),
         }
@@ -166,7 +226,8 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
                 "name": profile.get("name") or row.get("Name", row["Code"]),
                 "exchange": str(row.get("Market", "N/A")),
                 "market_type": "KRX",
-                "sector": profile.get("sector"),
+                "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
+                "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
                 "industry": profile.get("industry"),
                 "products": profile.get("products"),
             }
@@ -201,11 +262,58 @@ def get_stock_snapshot_krx(symbol: str) -> Dict[str, Any]:
 
 
 def get_stock_snapshot_global(symbol: str) -> Dict[str, Any]:
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="1y")
-    info = ticker.info or {}
+    import tempfile
+    import yfinance.cache as yf_cache
+
+    try:
+        cache_dir = os.path.join(tempfile.gettempdir(), "yfinance-cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        yf_cache.set_cache_location(cache_dir)
+        yf.set_tz_cache_location(cache_dir)
+    except Exception:
+        pass
+
+    hist = yf.download(symbol, period="1y", progress=False, auto_adjust=False, threads=False)
+    if isinstance(hist.columns, pd.MultiIndex):
+        # flatten multi-index columns from yfinance download
+        hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+
     if hist.empty:
-        raise ValueError("해외 종목 가격 데이터를 가져오지 못했습니다.")
+        try:
+            hist = yf.Ticker(symbol).history(period="1y", auto_adjust=False)
+        except Exception:
+            hist = pd.DataFrame()
+
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+
+    if hist.empty:
+        try:
+            hist = yf.download(symbol, period="6mo", progress=False, auto_adjust=False, threads=False)
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
+        except Exception:
+            hist = pd.DataFrame()
+
+    info = {}
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:
+        info = {}
+    if hist.empty:
+        return {
+            "symbol": symbol,
+            "latest_close": None,
+            "change_pct": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+            "volume": None,
+            "currency": info.get("currency", "USD"),
+            "company_description": info.get("longBusinessSummary") or "해외 종목 가격 데이터를 가져오지 못했습니다.",
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "company_name": info.get("longName") or info.get("shortName") or symbol,
+        }
     latest = hist.iloc[-1]
     prev = hist.iloc[-2] if len(hist) > 1 else None
     latest_close = float(latest["Close"])
@@ -223,6 +331,30 @@ def get_stock_snapshot_global(symbol: str) -> Dict[str, Any]:
         "industry": info.get("industry"),
         "company_name": info.get("longName") or info.get("shortName") or symbol,
     }
+
+
+@lru_cache(maxsize=1)
+def get_global_seed_profiles() -> List[Dict[str, str]]:
+    profiles: List[Dict[str, str]] = []
+    for ticker in GLOBAL_SEED_TICKERS:
+        try:
+            info = {}
+            try:
+                info = yf.Ticker(ticker).info or {}
+            except Exception:
+                info = {}
+            profiles.append(
+                {
+                    "symbol": ticker,
+                    "name": str(info.get("longName") or info.get("shortName") or ticker),
+                    "sector": str(info.get("sector") or ""),
+                    "industry": str(info.get("industry") or ""),
+                    "summary": str(info.get("longBusinessSummary") or ""),
+                }
+            )
+        except Exception:
+            continue
+    return profiles
 
 
 def fetch_wikipedia_summary(term: str) -> Optional[str]:
@@ -285,13 +417,63 @@ def extract_theme_keyword_hits(text: str) -> Dict[str, set]:
     return hits
 
 
+def infer_theme_groups(themes: List[str]) -> set:
+    groups = set()
+    for t in themes:
+        g = THEME_EXCLUSIVE_GROUPS.get(t)
+        if g:
+            groups.add(g)
+    return groups
+
+
 def get_stock_snapshot(symbol: str, market_type: str = "KRX") -> Dict[str, Any]:
     return get_stock_snapshot_global(symbol) if market_type == "GLOBAL" else get_stock_snapshot_krx(symbol)
 
 
 def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, str]]:
     if match.get("market_type") != "KRX":
-        return []
+        base_symbol = str(match.get("symbol", "")).upper()
+        base_info = {}
+        try:
+            base_info = yf.Ticker(base_symbol).info or {}
+        except Exception:
+            base_info = {}
+
+        base_sector = str(base_info.get("sector") or "")
+        base_industry = str(base_info.get("industry") or "")
+        base_summary = str(base_info.get("longBusinessSummary") or "")
+        base_tokens = set(tokenize_kr_text(base_summary + " " + base_industry + " " + base_sector))
+
+        candidates = get_global_seed_profiles()
+        scored: List[Dict[str, Any]] = []
+        for c in candidates:
+            symbol = c.get("symbol", "").upper()
+            if symbol == base_symbol:
+                continue
+            same_industry = int(bool(base_industry and c.get("industry") == base_industry))
+            same_sector = int(bool(base_sector and c.get("sector") == base_sector))
+            cand_tokens = set(tokenize_kr_text(c.get("summary", "") + " " + c.get("industry", "") + " " + c.get("sector", "")))
+            text_overlap = len(base_tokens.intersection(cand_tokens))
+            score = (same_industry * 15) + (same_sector * 8) + text_overlap
+            if score <= 0:
+                continue
+            matched_theme = c.get("industry") or c.get("sector") or "GLOBAL"
+            scored.append(
+                {
+                    "symbol": symbol,
+                    "name": c.get("name", symbol),
+                    "industry": c.get("industry", ""),
+                    "products": c.get("industry", ""),
+                    "matched_themes": matched_theme,
+                    "theme_score": same_industry + same_sector,
+                    "keyword_score": text_overlap,
+                    "text_score": text_overlap,
+                    "matched_keywords": "global-profile-match",
+                    "score": score,
+                }
+            )
+        scored.sort(key=lambda x: (-x["score"], x["symbol"]))
+        return [{k: str(v) for k, v in row.items() if k != "score"} for row in scored[:limit]]
 
     symbol = str(match.get("symbol", ""))
     theme_map = load_krx_theme_map()
@@ -307,6 +489,7 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
     base_auto_themes = set(infer_themes_from_text(base_text))
     base_theme_hits = extract_theme_keyword_hits(base_text)
     base_themes = set(theme_map.get(symbol, [])) | base_auto_themes
+    base_groups = infer_theme_groups(list(base_themes))
 
     if base_themes:
         base_tokens = set(
@@ -346,6 +529,9 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             overlap = sorted(base_themes.intersection(themes | auto_themes))
             if not overlap:
                 continue
+            cand_groups = infer_theme_groups(list(themes | auto_themes))
+            if base_groups and cand_groups and base_groups.isdisjoint(cand_groups):
+                continue
             cand_tokens = set(
                 tokenize_kr_text(" ".join([to_text(name), to_text(industry), to_text(products), to_text(sector)]))
             )
@@ -360,8 +546,12 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
                     keyword_overlap_count += len(inter)
                     matched_keywords.extend([f"{t}:{k}" for k in inter])
 
+            # Strict filter: require at least one concrete business keyword overlap.
+            if keyword_overlap_count < 1:
+                continue
+
             # prioritize concrete product/industry keyword matches
-            total_score = (len(overlap) * 10) + (keyword_overlap_count * 6) + text_overlap
+            total_score = (len(overlap) * 12) + (keyword_overlap_count * 10) + text_overlap
             scored.append({
                 "symbol": code,
                 "name": name,
