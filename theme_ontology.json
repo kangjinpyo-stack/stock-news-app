@@ -1,0 +1,52 @@
+﻿{
+  "themes": [
+    {
+      "name": "유리기판",
+      "group": "semiconductor",
+      "core_keywords": ["유리기판", "글라스기판", "tgv", "패키징기판", "반도체기판"],
+      "value_chain": ["소재", "장비", "패키징", "고객사"]
+    },
+    {
+      "name": "HBM",
+      "group": "semiconductor",
+      "core_keywords": ["hbm", "고대역폭메모리", "advanced packaging", "2.5d", "3d 적층"],
+      "value_chain": ["메모리", "장비", "패키징", "기판"]
+    },
+    {
+      "name": "2차전지",
+      "group": "battery",
+      "core_keywords": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬"],
+      "value_chain": ["소재", "셀", "장비", "재활용"]
+    },
+    {
+      "name": "정유화학",
+      "group": "energy",
+      "core_keywords": ["정유", "석유", "석유화학", "윤활유", "아스팔트", "납사", "정제품"],
+      "value_chain": ["정유", "화학", "유통"]
+    },
+    {
+      "name": "바이오",
+      "group": "bio",
+      "core_keywords": ["바이오", "제약", "의약품", "cdmo", "신약", "항체", "백신"],
+      "value_chain": ["원료", "개발", "생산", "유통"]
+    },
+    {
+      "name": "전력인프라",
+      "group": "energy",
+      "core_keywords": ["변압기", "전력", "전선", "배전", "송전", "전력기기"],
+      "value_chain": ["기기", "시공", "운영"]
+    },
+    {
+      "name": "로봇",
+      "group": "robotics",
+      "core_keywords": ["로봇", "자동화", "협동로봇", "모빌리티", "액추에이터"],
+      "value_chain": ["부품", "장비", "서비스"]
+    },
+    {
+      "name": "AI",
+      "group": "it",
+      "core_keywords": ["ai", "인공지능", "llm", "gpu", "데이터센터", "클라우드"],
+      "value_chain": ["인프라", "모델", "서비스"]
+    }
+  ]
+}

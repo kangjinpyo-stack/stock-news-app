@@ -83,3 +83,26 @@ streamlit run stock_streamlit_app.py
 배포 후 참고:
 - KRX/뉴스 데이터는 외부 네트워크 상태에 따라 일부 항목이 비어 보일 수 있습니다.
 - 종목명 검색이 불안정하면 종목코드(예: `348370`, `005930`)를 사용하세요.
+
+## 7) 관련주 정확도 점검
+
+관련주 추천 로직은 아래 테스트 케이스로 자동 점검할 수 있습니다.
+
+```powershell
+python accuracy_check.py
+```
+
+파일:
+- `related_test_cases.json`: 정답/오답 기대값
+- `accuracy_check.py`: 자동 평가 스크립트
+
+출력 항목:
+- `PASS`: 기대 조건 충족
+- `FAIL`: 기대 조건 미충족
+- `SKIP`: 네트워크/데이터 문제로 평가 불가
+
+예시:
+```powershell
+python accuracy_check.py --save-report accuracy_report.json
+```
+

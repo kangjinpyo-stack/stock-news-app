@@ -4,3 +4,4 @@ finance-datareader>=0.9.90
 yfinance>=0.2.40
 feedparser>=6.0.11
 requests>=2.32.0
+pykrx==1.0.48

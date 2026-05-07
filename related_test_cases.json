@@ -1,0 +1,77 @@
+﻿[
+  {
+    "name": "코미코는 배터리 관련주가 메인으로 뜨면 안 됨",
+    "query": "코미코",
+    "match_override": {
+      "symbol": "183300",
+      "name": "코미코",
+      "market_type": "KRX",
+      "exchange": "KOSDAQ",
+      "industry": "반도체 공정용 부품 세정 및 코팅 서비스업",
+      "products": "반도체 부품 세정, 특수 코팅, 공정 부품 재생",
+      "company_description": "코미코는 반도체 제조 공정에 사용되는 핵심 부품의 세정과 특수 코팅을 주력으로 하는 기업이다. 반도체 장비 부품 수명 연장과 수율 안정화에 필요한 서비스를 제공한다."
+    },
+    "must_include_buckets": ["반도체 관련주"],
+    "must_exclude_buckets": ["배터리 관련주"]
+  },
+  {
+    "name": "SKC는 유리기판 축이 보여야 함",
+    "query": "SKC",
+    "match_override": {
+      "symbol": "011790",
+      "name": "SKC",
+      "market_type": "KRX",
+      "exchange": "KOSPI",
+      "industry": "반도체 및 이차전지 소재 제조업",
+      "products": "유리기판, 동박, 반도체 패키징 소재",
+      "company_description": "SKC는 반도체 유리기판과 이차전지 소재, 화학소재 사업을 영위한다. 최근에는 유리기판과 반도체 패키징 소재가 핵심 성장 사업으로 부각된다."
+    },
+    "must_include_themes": ["유리기판"],
+    "must_exclude_buckets": ["바이오 관련주"]
+  },
+  {
+    "name": "엔켐은 2차전지 축이 보여야 함",
+    "query": "엔켐",
+    "match_override": {
+      "symbol": "348370",
+      "name": "엔켐",
+      "market_type": "KRX",
+      "exchange": "KOSDAQ",
+      "industry": "기초 화학물질 제조업",
+      "products": "2차전지 전해액",
+      "company_description": "엔켐은 전기차용 및 ESS용 2차전지 전해액을 생산하는 배터리 소재 기업이다. 전해액 공급 확대와 글로벌 고객사 수요가 실적의 핵심 변수다."
+    },
+    "must_include_buckets": ["배터리 관련주"],
+    "must_include_themes": ["2차전지"],
+    "must_exclude_buckets": ["바이오 관련주"]
+  },
+  {
+    "name": "SK이노베이션은 배터리와 에너지 축이 같이 나와야 함",
+    "query": "SK이노베이션",
+    "match_override": {
+      "symbol": "096770",
+      "name": "SK이노베이션",
+      "market_type": "KRX",
+      "exchange": "KOSPI",
+      "industry": "석유 정제, 배터리 및 에너지 사업",
+      "products": "정유, 석유화학, 배터리, ESS, LNG",
+      "company_description": "SK이노베이션은 정유와 석유화학 사업을 기반으로 배터리와 에너지저장장치, LNG 밸류체인까지 확장 중인 종합 에너지 기업이다. 배터리 자회사 SK온의 실적과 정제마진이 핵심 변수다."
+    },
+    "must_include_buckets": ["배터리 관련주", "에너지 관련주"]
+  },
+  {
+    "name": "삼성전자는 배터리 관련주가 메인으로 뜨면 안 됨",
+    "query": "삼성전자",
+    "match_override": {
+      "symbol": "005930",
+      "name": "삼성전자",
+      "market_type": "KRX",
+      "exchange": "KOSPI",
+      "industry": "반도체 및 전자제품 제조업",
+      "products": "메모리 반도체, 시스템 반도체, 스마트폰, 디스플레이",
+      "company_description": "삼성전자는 메모리 반도체와 스마트폰, 디스플레이, 가전 사업을 영위하는 글로벌 전자 기업이다. 반도체 업황과 AI 수요, 모바일 판매 흐름이 실적에 큰 영향을 준다."
+    },
+    "must_include_buckets": ["반도체 관련주"],
+    "must_exclude_buckets": ["배터리 관련주"]
+  }
+]
