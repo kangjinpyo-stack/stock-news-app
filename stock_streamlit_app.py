@@ -136,6 +136,18 @@ def infer_core_business_labels(industry: str, products: str, desc: str) -> str:
     return clean_products_text(products, industry, desc)
 
 
+def normalize_broken_parentheses(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.count("(") != cleaned.count(")"):
+        cleaned = cleaned.replace("(", "").replace(")", "")
+    cleaned = re.sub(r"\s+\)", ")", cleaned)
+    cleaned = re.sub(r"\(\s+", "(", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 def build_company_three_line_summary(name, industry, products, desc, news_items):
     industry_text = industry if industry and industry != "N/A" else "업종 정보 확인 필요"
     core_business = infer_core_business_labels(industry, products, desc)
@@ -151,6 +163,7 @@ def build_company_three_line_summary(name, industry, products, desc, news_items)
                 continue
             cleaned = cleaned.replace("동사는", name + "는")
             cleaned = cleaned.replace("  ", " ").strip()
+            cleaned = normalize_broken_parentheses(cleaned)
             # Drop broken tail fragments such as ") 분야 기업입니다."
             if len(cleaned) < 12:
                 continue
@@ -190,6 +203,7 @@ def build_company_three_line_summary(name, industry, products, desc, news_items)
 
     cleaned_lines = []
     for line in lines:
+        line = normalize_broken_parentheses(line)
         if line and line not in cleaned_lines:
             cleaned_lines.append(line)
     return cleaned_lines[:5]
@@ -618,6 +632,8 @@ if effective_run or st.session_state.get("last_match"):
                         if peers:
                             sales_basis = peers[0].get("sales_basis", "최근 분기")
                             op_basis = peers[0].get("op_basis", "최근 분기")
+                            current_symbol = str(match.get("symbol", "")).strip()
+                            current_name = str(match.get("name", "")).strip()
                             peers_df = pd.DataFrame(peers).rename(
                                 columns={
                                     "name": "종목명",
@@ -637,8 +653,20 @@ if effective_run or st.session_state.get("last_match"):
                                     peers_df[col] = peers_df[col].apply(
                                         lambda x: fmt_num(str(x).replace(",", ""), ",.0f") if str(x).strip() not in {"", "N/A"} else "N/A"
                                     )
-                            peers_df = peers_df.drop(columns=["sales_basis", "op_basis", "symbol"], errors="ignore")
-                            st.dataframe(peers_df, use_container_width=True, hide_index=True)
+                            if "symbol" in peers_df.columns:
+                                peers_df["_is_current"] = (
+                                    (peers_df["symbol"].astype(str).str.strip() == current_symbol)
+                                    | (peers_df["종목명"].astype(str).str.strip() == current_name)
+                                )
+                                peers_df = peers_df.sort_values(by="_is_current", ascending=False, kind="stable").reset_index(drop=True)
+                            else:
+                                peers_df["_is_current"] = False
+                            peers_df = peers_df.drop(columns=["sales_basis", "op_basis"], errors="ignore")
+                            styled_peers = peers_df.drop(columns=["symbol", "_is_current"], errors="ignore").style.apply(
+                                lambda row: ["font-weight: 800; background-color: #eef6ff; color: #0f172a;" for _ in row] if bool(peers_df.loc[row.name, "_is_current"]) else ["" for _ in row],
+                                axis=1,
+                            )
+                            st.dataframe(styled_peers, use_container_width=True, hide_index=True)
                             st.caption(f"기준: 현재가/시가총액은 조회 시점 기준입니다. 매출액/영업이익은 네이버 종목비교 표의 최근 실제 분기인 {sales_basis} 값을 사용합니다.")
                         else:
                             st.caption("동종업계 비교 데이터를 가져오지 못했습니다.")

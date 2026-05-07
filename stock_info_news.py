@@ -1408,9 +1408,12 @@ def get_krx_peer_comparison(symbol: str) -> List[Dict[str, Any]]:
                 col_name = cols[j]
                 peer_name = col_name.split("*")[0].strip()
                 peer_symbol = col_name.split("*")[-1].strip() if "*" in col_name else ""
+                if not peer_symbol:
+                    m_code = re.search(r"(\d{6})$", peer_name)
+                    if m_code:
+                        peer_symbol = m_code.group(1)
+                        peer_name = peer_name[: m_code.start()].strip()
                 if not peer_name:
-                    continue
-                if peer_symbol == symbol:
                     continue
                 price = row_map.get("현재가", pd.Series()).iloc[j] if "현재가" in row_map else None
                 mcap = row_map.get("시가총액(억)", pd.Series()).iloc[j] if "시가총액(억)" in row_map else None
