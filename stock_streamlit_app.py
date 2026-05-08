@@ -2,6 +2,7 @@
 from collections import OrderedDict
 
 import re
+from urllib.parse import quote_plus
 
 import altair as alt
 import pandas as pd
@@ -12,10 +13,12 @@ from stock_info_news import (
     enrich_company_profile,
     get_krx_financial_table,
     get_krx_fundamentals_and_flow,
+    get_market_wide_movers,
     get_krx_peer_comparison,
     get_related_stocks,
     get_recent_news,
     get_stock_snapshot,
+    get_today_theme_movers,
     search_symbol,
 )
 
@@ -37,6 +40,13 @@ if "last_related" not in st.session_state:
     st.session_state["last_related"] = []
 if "last_extra" not in st.session_state:
     st.session_state["last_extra"] = {}
+
+applied_pending_query = ""
+pending_query = st.session_state.get("pending_query")
+if pending_query:
+    st.session_state["query_input"] = pending_query
+    applied_pending_query = pending_query
+    st.session_state["pending_query"] = None
 if "last_peers" not in st.session_state:
     st.session_state["last_peers"] = []
 if "last_financial_table" not in st.session_state:
@@ -45,6 +55,12 @@ if "last_financial_table" not in st.session_state:
 if st.session_state.get("pending_query"):
     st.session_state["query_input"] = st.session_state["pending_query"]
     st.session_state["pending_query"] = None
+
+qp_query = st.query_params.get("q")
+if qp_query:
+    st.session_state["pending_query"] = str(qp_query)
+    st.session_state["auto_search"] = True
+    st.query_params.clear()
 
 st.set_page_config(page_title="KRX Stock Pulse", page_icon="📊", layout="wide")
 
@@ -78,7 +94,9 @@ def build_company_profile_line(name: str, industry: str, products: str, desc: st
 
 
 def clean_products_text(products: str, industry: str, desc: str) -> str:
-    text = (products or "").strip()
+    text = str(products or "").strip()
+    if text.lower() in {"nan", "none"}:
+        text = ""
     if text and text != "N/A":
         for token in ["제품 등", "사업 등", "제조 및 판매", "제조", "도매", "소매"]:
             text = text.replace(token, "")
@@ -94,8 +112,11 @@ def clean_products_text(products: str, industry: str, desc: str) -> str:
         if short:
             return short
 
-    if industry and industry != "N/A":
-        return industry
+    industry_text = str(industry or "").strip()
+    if industry_text.lower() in {"nan", "none"}:
+        industry_text = ""
+    if industry_text and industry_text != "N/A":
+        return industry_text
 
     desc_sentence = first_sentence(desc, limit=60)
     return desc_sentence if desc_sentence else "확인 필요"
@@ -321,6 +342,102 @@ def group_related_items(related):
         grouped[label].append(item)
     return [(label, items) for label, items in grouped.items() if items]
 
+
+def build_theme_tile_style(avg_change: float) -> str:
+    strength = min(max(abs(avg_change), 0.0), 10.0) / 10.0
+    if avg_change >= 0:
+        base = (255, 99, 71)
+        alpha = 0.24 + (0.58 * strength)
+        text = "#fff7ed" if strength > 0.35 else "#7f1d1d"
+    else:
+        base = (37, 99, 235)
+        alpha = 0.20 + (0.52 * strength)
+        text = "#eff6ff" if strength > 0.35 else "#1e3a8a"
+    return f"background: rgba({base[0]}, {base[1]}, {base[2]}, {alpha:.2f}); color: {text};"
+
+
+def build_theme_tile_span(avg_change: float, member_count: int) -> tuple[int, int]:
+    magnitude = abs(avg_change)
+    if magnitude >= 4 or member_count >= 4:
+        return 2, 2
+    if magnitude >= 2:
+        return 2, 1
+    return 1, 1
+
+
+def chunked_rows(items, per_row: int = 2):
+    return [items[idx : idx + per_row] for idx in range(0, len(items), per_row)]
+
+
+def build_theme_bubble_style(avg_change: float, member_count: int) -> tuple[int, str, str]:
+    intensity = min(max(abs(avg_change), 0.0), 12.0) / 12.0
+    size = 96 + int(intensity * 116) + min(max(member_count, 1), 6) * 4
+    if avg_change >= 0:
+        bg = f"radial-gradient(circle at 30% 30%, rgba(255,250,250,0.98), rgba(254,202,202,{0.18 + 0.34 * intensity:.2f}) 42%, rgba(248,113,113,{0.28 + 0.40 * intensity:.2f}) 66%, rgba(220,38,38,{0.34 + 0.54 * intensity:.2f}) 100%)"
+        text = "#7f1d1d" if intensity < 0.72 else "#fff7ed"
+    else:
+        bg = f"radial-gradient(circle at 30% 30%, rgba(248,fb,255,0.98), rgba(191,219,254,{0.18 + 0.30 * intensity:.2f}) 42%, rgba(96,165,250,{0.26 + 0.36 * intensity:.2f}) 66%, rgba(29,78,216,{0.34 + 0.52 * intensity:.2f}) 100%)"
+        text = "#1e3a8a" if intensity < 0.72 else "#eff6ff"
+    return size, bg, text
+
+
+def render_theme_bubble_cluster(rows, positive: bool = True) -> str:
+    if not rows:
+        empty_label = "상승 테마를 아직 만들지 못했습니다." if positive else "하락 테마를 아직 만들지 못했습니다."
+        return f"<div class='theme-bubble-empty'>{empty_label}</div>"
+
+    bubbles = []
+    sorted_rows = sorted(
+        rows,
+        key=lambda x: (abs(float(x.get('avg_change', 0))), int(x.get('member_count', 0))),
+        reverse=True,
+    )[:6]
+    for row in sorted_rows:
+        avg_change = float(row.get("avg_change", 0))
+        member_count = int(row.get("member_count", 0))
+        size, bg, text = build_theme_bubble_style(avg_change, member_count)
+        sign = "+" if avg_change > 0 else ""
+        strength = min(max(abs(avg_change), 0.0), 12.0) / 12.0
+        ring = 1 + int(strength * 3)
+        ring_color = "rgba(185,28,28,0.55)" if avg_change >= 0 else "rgba(30,64,175,0.55)"
+        bubbles.append(
+            f"""
+            <div class="theme-bubble" style="width:{size}px; height:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
+              <div class="theme-bubble-name">{row.get('theme', '')}</div>
+              <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
+              <div class="theme-bubble-meta">{member_count}종목</div>
+            </div>
+            """
+        )
+    return "".join(bubbles)
+
+
+def collect_theme_leaderboard(theme_movers):
+    seen = {}
+    source_items = theme_movers.get("all_items") or []
+    if source_items:
+        for member in source_items:
+            key = str(member.get("symbol", "")).strip()
+            if not key:
+                continue
+            existing = seen.get(key)
+            if existing is None or abs(float(member.get("change_pct", 0))) > abs(float(existing.get("change_pct", 0))):
+                seen[key] = member
+    else:
+        for group_name in ("up", "down"):
+            for row in theme_movers.get(group_name, []):
+                for member in row.get("members", []):
+                    key = str(member.get("symbol", "")).strip()
+                    if not key:
+                        continue
+                    existing = seen.get(key)
+                    if existing is None or abs(float(member.get("change_pct", 0))) > abs(float(existing.get("change_pct", 0))):
+                        seen[key] = member
+    items = list(seen.values())
+    rising = sorted([x for x in items if float(x.get("change_pct", 0)) > 0], key=lambda x: -float(x.get("change_pct", 0)))
+    falling = sorted([x for x in items if float(x.get("change_pct", 0)) < 0], key=lambda x: float(x.get("change_pct", 0)))
+    return rising[:6], falling[:6]
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_snapshot_cached(symbol: str, market_type: str):
     return enrich_company_profile({"symbol": symbol, "market_type": market_type}, get_stock_snapshot(symbol, market_type))
@@ -369,6 +486,21 @@ def load_peers_cached(symbol: str):
 def load_financial_table_cached(symbol: str):
     return get_krx_financial_table(symbol)
 
+
+THEME_MOVER_CACHE_VERSION = "theme-v3"
+MARKET_MOVER_UI_VERSION = "bubble-v19"
+MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top100-v1"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_today_theme_movers_cached(_version: str = THEME_MOVER_CACHE_VERSION):
+    return get_today_theme_movers(limit_themes=4, members_per_theme=4)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market_wide_movers_cached(_version: str = MARKET_WIDE_MOVER_CACHE_VERSION):
+    return get_market_wide_movers(limit_each_market=60, top_n=100)
+
 st.markdown(
     """
     <style>
@@ -392,13 +524,61 @@ st.markdown(
       padding-top: 1.2rem;
       padding-bottom: 2rem;
     }
-    .hero {
-      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-      color: #e2e8f0;
-      border-radius: 16px;
-      padding: 20px 24px;
-      border: 1px solid #334155;
-      margin-bottom: 16px;
+    .hero-shell {
+      background: #ffffff;
+      border: 1px solid #dbe4f0;
+      border-radius: 18px;
+      padding: 18px 20px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+      margin-bottom: 14px;
+    }
+    .hero-top {
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap: 12px;
+    }
+    .hero-title {
+      font-family: "Pretendard", "Noto Sans KR", sans-serif;
+      font-size: 2.05rem;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #0f1f3d;
+      margin: 0;
+    }
+    .live-badge {
+      display:inline-flex;
+      align-items:center;
+      gap: 6px;
+      margin-left: 10px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: #0f766e;
+      background: #e6fffb;
+      border: 1px solid #c6f2eb;
+      vertical-align: middle;
+    }
+    .hero-sub {
+      margin-top: 8px;
+      color: #5b6784;
+      font-size: 1.03rem;
+      font-weight: 500;
+      letter-spacing: -0.1px;
+    }
+    .hero-right {
+      color:#64748b;
+      font-size:0.92rem;
+      margin-top:6px;
+      white-space:nowrap;
+    }
+    .search-card {
+      margin-top: 14px;
+      border: 1px solid #dbe4f0;
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: linear-gradient(180deg,#ffffff 0%,#f9fbff 100%);
     }
     .kpi {
       background: var(--card);
@@ -468,7 +648,7 @@ st.markdown(
     .score-bar-theme { height:100%; background:linear-gradient(90deg,#0ea5e9,#0369a1); }
     .score-bar-text { height:100%; background:linear-gradient(90deg,#22c55e,#15803d); }
     .score-num { width:24px; text-align:right; font-size:0.68rem; color:var(--muted); }
-    .search-wrap { max-width: 400px; margin: 0 auto 8px auto; }
+    .search-wrap { max-width: 100%; margin: 0; }
     div[data-testid="stTextInput"] input {
       height: 44px;
       border-radius: 10px;
@@ -478,6 +658,14 @@ st.markdown(
       border-radius: 10px;
       margin-top: 0 !important;
     }
+    div[data-testid="stButton"] button {
+      white-space: nowrap !important;
+      word-break: keep-all !important;
+      min-width: 72px;
+      height: 40px;
+      border-radius: 10px;
+      padding: 0 12px;
+    }
     .quote-card {
       background: #ffffff;
       border: 1px solid #dbe4f0;
@@ -486,7 +674,522 @@ st.markdown(
       box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
       margin-bottom: 14px;
     }
+    .theme-board {
+      background: #ffffff;
+      border: 1px solid #dbe4f0;
+      border-radius: 16px;
+      padding: 14px 16px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+      margin: 10px 0 18px 0;
+    }
+    .theme-head {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-bottom:10px;
+    }
+    .theme-chip-row {
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      margin-top:8px;
+    }
+    .theme-chip {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:0.8rem;
+      border:1px solid #dbe4f0;
+      background:#f8fafc;
+      color:#0f172a;
+      white-space:nowrap;
+    }
+    .theme-item {
+      border-top: 1px solid #edf2f7;
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    .theme-title {
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .theme-change-up { color:#15803d; font-weight:700; }
+    .theme-change-down { color:#b91c1c; font-weight:700; }
+    .market-title {
+      font-family: "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      letter-spacing: -0.25px;
+      font-weight: 800;
+      font-size: 1.45rem;
+      margin: 2px 0 12px 0;
+      color: #0b1736;
+    }
+    .theme-bubble-board {
+      background:
+        radial-gradient(circle at 15% 15%, rgba(254,226,226,0.55), transparent 24%),
+        radial-gradient(circle at 85% 18%, rgba(219,234,254,0.72), transparent 28%),
+        linear-gradient(180deg, #fffdfd 0%, #f8fbff 100%);
+      border:1px solid #dbe4f0;
+      border-radius:22px;
+      padding:18px 18px 20px 18px;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+    }
+    .theme-bubble-grid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    .theme-bubble-lane {
+      min-height: 220px;
+      border-radius: 20px;
+      padding: 16px;
+      border: 1px solid rgba(219,228,240,0.9);
+      background: rgba(255,255,255,0.74);
+      display:flex;
+      flex-direction:column;
+    }
+    .theme-bubble-lane.up {
+      background: linear-gradient(180deg, rgba(255,245,245,0.96) 0%, rgba(255,255,255,0.80) 100%);
+    }
+    .theme-bubble-lane.down {
+      background: linear-gradient(180deg, rgba(239,246,255,0.96) 0%, rgba(255,255,255,0.82) 100%);
+    }
+    .theme-bubble-lane-title {
+      font-size: 1rem;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 12px;
+    }
+    .theme-bubble-wrap {
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      align-content:flex-start;
+      justify-content:flex-start;
+      gap: 12px;
+      flex:1;
+    }
+    .theme-bubble {
+      border-radius: 999px;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      justify-content:center;
+      text-align:center;
+      padding: 10px;
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.45),
+        0 10px 24px rgba(15, 23, 42, 0.10);
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    .theme-bubble:hover {
+      transform: translateY(-2px);
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.45),
+        0 14px 30px rgba(15, 23, 42, 0.14);
+    }
+    .theme-bubble-name {
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      font-size: 1.02rem;
+      font-weight: 900;
+      line-height: 1.2;
+      max-width: 88%;
+      white-space: normal;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      text-wrap: pretty;
+    }
+    .theme-bubble-change {
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      font-size: 1rem;
+      font-weight: 800;
+      margin-top: 5px;
+    }
+    .theme-bubble-meta {
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      font-size: 0.74rem;
+      margin-top: 4px;
+      opacity: 0.95;
+    }
+    .theme-bubble-empty {
+      color:#64748b;
+      font-size:0.88rem;
+      padding:18px 8px;
+    }
+    .theme-mover-grid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 8px;
+    }
+    .theme-rank-card {
+      background:#ffffff;
+      border:1px solid #dbe4f0;
+      border-radius:16px;
+      padding:12px 14px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+      height:100%;
+    }
+    .theme-rank-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      min-height:40px;
+    }
+    .theme-rank-divider {
+      border-top:1px solid #edf2f7;
+      margin:8px 0 10px 0;
+    }
+    .theme-rank-name {
+      font-weight:700;
+      color:#0f172a;
+      display:flex;
+      align-items:baseline;
+      gap:6px;
+      white-space:nowrap;
+    }
+    .theme-rank-sub {
+      font-size:0.78rem;
+      color:#64748b;
+    }
+    .theme-rank-code {
+      font-size:0.8rem;
+      color:#64748b;
+      font-weight:500;
+      white-space:nowrap;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"] > button,
+    .st-key-mover-list-down div[data-testid="stButton"] > button {
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+      text-align: left;
+      justify-content: flex-start;
+      align-items: center;
+      white-space: nowrap !important;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      border: none !important;
+      padding: 0 !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      min-height: 24px !important;
+      height: 24px !important;
+      min-width: 0;
+      border-radius: 0;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 24px !important;
+      font-size: 0.82rem;
+      letter-spacing: 0;
+      transition: none;
+      display:flex !important;
+      align-items:center !important;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"],
+    .st-key-mover-list-down div[data-testid="stButton"] {
+      margin: 0 !important;
+      padding: 0 !important;
+      line-height: 24px !important;
+      min-height: 24px !important;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"] > div,
+    .st-key-mover-list-down div[data-testid="stButton"] > div {
+      margin: 0 !important;
+      padding: 0 !important;
+      min-height: 24px !important;
+      display:flex !important;
+      align-items:center !important;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"] > button p,
+    .st-key-mover-list-up div[data-testid="stButton"] > button span,
+    .st-key-mover-list-down div[data-testid="stButton"] > button p,
+    .st-key-mover-list-down div[data-testid="stButton"] > button span {
+      white-space: nowrap !important;
+      word-break: keep-all !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      line-height: 24px !important;
+      margin: 0 !important;
+      height: 24px !important;
+      display: flex !important;
+      align-items: center !important;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"] > button > div,
+    .st-key-mover-list-down div[data-testid="stButton"] > button > div {
+      height: 24px !important;
+      line-height: 24px !important;
+      display:flex !important;
+      align-items:center !important;
+    }
+    .st-key-mover-list-up div[data-testid="stMarkdown"] p,
+    .st-key-mover-list-down div[data-testid="stMarkdown"] p {
+      margin: 0 !important;
+      line-height: 1.2 !important;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"] > button:hover,
+    .st-key-mover-list-down div[data-testid="stButton"] > button:hover { transform:none; }
+    .st-key-mover-list-up div[data-testid="stButton"] > button {
+      color: #111827;
+    }
+    .st-key-mover-list-down div[data-testid="stButton"] > button {
+      color: #111827;
+    }
+    .mover-list-scroll {
+      max-height: 300px;
+      overflow-y: auto;
+      padding-right: 6px;
+    }
+    .mover-list-scroll::-webkit-scrollbar {
+      width: 8px;
+    }
+    .mover-list-scroll::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 999px;
+    }
+    .mover-list-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .mover-col {
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+    }
+    .mover-head-row {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-bottom:10px;
+    }
+    .mover-sub {
+      color:#64748b;
+      font-size:0.83rem;
+      font-weight:600;
+    }
+    .mover-rank-note {
+      color:#94a3b8;
+      font-size:0.76rem;
+      margin-top:2px;
+    }
+    .mover-head-row .market-title {
+      margin: 0;
+      font-size: 0.96rem;
+      font-weight: 800;
+      color: #1b2433;
+      letter-spacing: 0;
+      line-height: 1.25;
+    }
+    .mover-more-pill {
+      display:inline-flex;
+      align-items:center;
+      gap:4px;
+      padding:6px 12px;
+      border:1px solid #e7edf6;
+      border-radius:999px;
+      color:#4b5b73;
+      background:#ffffff;
+      font-size:0.75rem;
+      font-weight:700;
+      box-shadow:0 2px 6px rgba(15,23,42,0.04);
+    }
+    .mover-footer-link {
+      text-align:center;
+      color:#2d5bcf;
+      font-size:0.8rem;
+      font-weight:700;
+      margin-top:8px;
+    }
+    .rank-pill {
+      min-width:24px;
+      height:24px;
+      border-radius:2px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      line-height:24px;
+      font-size:0.74rem;
+      font-weight:800;
+      background:#ffffff;
+      border:1px solid #e5ebf4;
+    }
+    .st-key-mover-list-up .rank-pill {
+      color:#ef6b73;
+      border-color:#f8dde0;
+      background:#fff7f8;
+      box-shadow:none;
+    }
+    .st-key-mover-list-down .rank-pill {
+      color:#5f8fe9;
+      border-color:#dee8ff;
+      background:#f7faff;
+      box-shadow:none;
+    }
+    .pct-up {
+      color:#f0737b;
+      font-size:0.8rem;
+      font-weight:800;
+      text-align:right;
+      white-space:nowrap;
+      line-height:24px;
+      margin:0;
+      font-variant-numeric: tabular-nums;
+      height:24px;
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      position: relative;
+      top: 0;
+    }
+    .pct-down {
+      color:#6c95eb;
+      font-size:0.8rem;
+      font-weight:800;
+      text-align:right;
+      white-space:nowrap;
+      line-height:24px;
+      margin:0;
+      font-variant-numeric: tabular-nums;
+      height:24px;
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      position: relative;
+      top: 0;
+    }
+    .mover-row-link {
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      width:100%;
+      text-decoration:none !important;
+      min-height:24px;
+      transform: none;
+    }
+    .mover-row-link:hover .mover-name-text {
+      text-decoration: underline;
+    }
+    .mover-name-text {
+      flex:1;
+      min-width:0;
+      color:#536273;
+      font-size:0.82rem;
+      font-weight:600;
+      line-height:24px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .mover-name-btn div[data-testid="stButton"] > button {
+      border: none !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      height: 22px !important;
+      min-height: 22px !important;
+      min-width: 0 !important;
+      border-radius: 0 !important;
+      color: #111827 !important;
+      font-size: 0.86rem !important;
+      font-weight: 600 !important;
+      text-align: left !important;
+      justify-content: flex-start !important;
+      line-height: 1.1 !important;
+      margin: 0 !important;
+    }
+    .mover-name-btn div[data-testid="stButton"] {
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    .mover-name-btn div[data-testid="stButton"] > button p {
+      margin: 0 !important;
+      line-height: 1.1 !important;
+    }
+    .st-key-mover-list-up [data-testid="stVerticalBlock"],
+    .st-key-mover-list-down [data-testid="stVerticalBlock"] {
+      gap: 0.28rem !important;
+    }
+    .st-key-mover-panel-up div[data-testid="stVerticalBlockBorderWrapper"],
+    .st-key-mover-panel-down div[data-testid="stVerticalBlockBorderWrapper"] {
+      background:#ffffff !important;
+      border:1px solid #e9eef6 !important;
+      border-radius:0 !important;
+      box-shadow:0 3px 10px rgba(15,23,42,0.045) !important;
+    }
+    .st-key-mover-panel-up div[data-testid="stVerticalBlockBorderWrapper"] > div,
+    .st-key-mover-panel-down div[data-testid="stVerticalBlockBorderWrapper"] > div {
+      padding:12px 12px 10px 12px !important;
+    }
+    .st-key-mover-list-up div[data-testid="stVerticalBlockBorderWrapper"] {
+      border: 1px solid #eaedf2 !important;
+      background: #fffdfd !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      width: 96% !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    .st-key-mover-list-down div[data-testid="stVerticalBlockBorderWrapper"] {
+      border: 1px solid #eaedf2 !important;
+      background: #fcfdff !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      width: 96% !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    .st-key-mover-list-up div[data-testid="stVerticalBlockBorderWrapper"] > div,
+    .st-key-mover-list-down div[data-testid="stVerticalBlockBorderWrapper"] > div {
+      padding: 4px 8px !important;
+      min-height: 34px !important;
+      display:flex !important;
+      align-items:center !important;
+      justify-content:center !important;
+    }
+    .st-key-mover-list-up div[data-testid="stVerticalBlockBorderWrapper"] {
+      background: #fffdfd !important;
+    }
+    .st-key-mover-list-down div[data-testid="stVerticalBlockBorderWrapper"] {
+      background: #fcfdff !important;
+    }
+    .st-key-mover-list-up div[data-testid="column"],
+    .st-key-mover-list-down div[data-testid="column"] {
+      min-width:0 !important;
+    }
+    .st-key-mover-list-up div[data-testid="column"] > div,
+    .st-key-mover-list-down div[data-testid="column"] > div {
+      height: 100%;
+      display: flex;
+      min-height: 24px;
+      align-items: center;
+    }
+    .st-key-mover-list-up div[data-testid="stButton"],
+    .st-key-mover-list-down div[data-testid="stButton"],
+    .st-key-mover-list-up div[data-testid="stMarkdown"],
+    .st-key-mover-list-down div[data-testid="stMarkdown"] {
+      margin: 0 !important;
+      width: 100%;
+      display: flex;
+      align-items: center;
+    }
+    .st-key-mover-list-up div[data-testid="column"]:first-child > div,
+    .st-key-mover-list-down div[data-testid="column"]:first-child > div {
+      justify-content: flex-start !important;
+    }
+    .st-key-mover-list-up div[data-testid="column"]:nth-child(2) > div,
+    .st-key-mover-list-down div[data-testid="column"]:nth-child(2) > div {
+      justify-content: flex-start !important;
+    }
+    .st-key-mover-list-up div[data-testid="column"]:last-child > div,
+    .st-key-mover-list-down div[data-testid="column"]:last-child > div {
+      justify-content: flex-end !important;
+    }
     @media (max-width: 900px) {
+      .theme-bubble-grid { grid-template-columns: 1fr; }
+      .theme-bubble-lane { min-height: 220px; }
+      .theme-mover-grid { grid-template-columns: 1fr; }
+      .theme-bubble-name { font-size: 0.92rem; }
+      .theme-bubble-change { font-size: 0.9rem; }
       .rel-row { flex-wrap:wrap; }
       .rel-main { width:100%; flex-wrap:wrap; }
       .rel-sub { white-space: normal; }
@@ -497,42 +1200,148 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-hero_left, hero_center, hero_right = st.columns([1, 1.2, 1])
-with hero_center:
-    st.markdown(
-        """
-        <div class="hero">
-          <h2 style="margin:0;">KRX Stock Pulse</h2>
-          <p style="margin:8px 0 0 0;">종목명 또는 종목코드로 주가와 최신 뉴스를 빠르게 조회합니다.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-outer_left, outer_center, outer_right = st.columns([1, 1.2, 1])
-with outer_center:
-    st.markdown("<div class='search-wrap'>", unsafe_allow_html=True)
-    with st.form("search_form", clear_on_submit=False):
-        st.caption("종목명 또는 종목코드")
-        col_in, col_btn = st.columns([4.2, 1], vertical_alignment="bottom")
-        query = col_in.text_input(
-            "종목명 또는 종목코드",
-            placeholder="예: 엔켐 또는 348370",
-            key="query_input",
-            label_visibility="collapsed",
+with st.container(border=True):
+    head_left, head_right = st.columns([6.2, 1.6], vertical_alignment="top")
+    with head_left:
+        st.markdown(
+            "<h1 class='hero-title'>KRX Stock Pulse <span class='live-badge'>실시간</span></h1>",
+            unsafe_allow_html=True,
         )
-        run = col_btn.form_submit_button("조회", type="primary", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='hero-sub'>종목명 또는 종목코드로 주가와 최신 뉴스를 빠르게 조회합니다.</div>",
+            unsafe_allow_html=True,
+        )
+    with head_right:
+        st.caption(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if st.button("새로고침", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
+with st.form("search_form", clear_on_submit=False):
+    col_in, col_btn = st.columns([5.2, 1], vertical_alignment="bottom")
+    query = col_in.text_input(
+        "종목명 또는 종목코드",
+        placeholder="예: 엔켐 또는 348370",
+        key="query_input",
+        label_visibility="collapsed",
+    )
+    run = col_btn.form_submit_button("조회", type="primary", use_container_width=True)
+
+effective_query = str(applied_pending_query or query or "")
 effective_run = run or st.session_state.get("auto_search", False)
+
+if not effective_run and not st.session_state.get("last_match"):
+    theme_movers = load_today_theme_movers_cached(THEME_MOVER_CACHE_VERSION)
+    market_wide_movers = load_market_wide_movers_cached(MARKET_WIDE_MOVER_CACHE_VERSION)
+    with st.container(border=True):
+        st.markdown("<h2 class='market-title'>오늘 테마 흐름</h2>", unsafe_allow_html=True)
+        st.caption(f"기준일: {theme_movers.get('as_of', dt.datetime.now().strftime('%Y-%m-%d'))}  |  화면 버전: {MARKET_MOVER_UI_VERSION}")
+        if theme_movers.get("error"):
+            st.warning(theme_movers.get("error"))
+        all_theme_rows = sorted(
+            theme_movers.get("up", []) + theme_movers.get("down", []),
+            key=lambda x: abs(float(x.get("avg_change", 0))),
+            reverse=True,
+        )[:10]
+        top_risers = market_wide_movers.get("rise", [])
+        top_fallers = market_wide_movers.get("fall", [])
+        up_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) >= 0]
+        down_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) < 0]
+
+        if all_theme_rows:
+            st.markdown(
+                f"""
+                <div class="theme-bubble-board">
+                  <div class="theme-bubble-grid">
+                    <div class="theme-bubble-lane up">
+                      <div class="theme-bubble-lane-title">강한 상승 테마</div>
+                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(up_theme_rows, positive=True)}</div>
+                    </div>
+                    <div class="theme-bubble-lane down">
+                      <div class="theme-bubble-lane-title">약세/하락 테마</div>
+                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(down_theme_rows, positive=False)}</div>
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("오늘 테마 맵을 아직 만들지 못했습니다.")
+            stats = theme_movers.get("stats", {})
+            if stats:
+                st.caption(f"조회 성공 {stats.get('success', 0)}건 / 실패 {stats.get('failed', 0)}건")
+
+        st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+
+        mover_left, mover_right = st.columns(2, vertical_alignment="top")
+
+        with mover_left:
+            with st.container(border=True, key="mover-panel-up"):
+                st.markdown(
+                    "<div class='mover-head-row'><h4 class='market-title'>🔥 시장 급등 종목 TOP 100</h4></div>",
+                    unsafe_allow_html=True,
+                )
+                if top_risers:
+                    with st.container(height=206, border=False, key="mover-list-up"):
+                        display_risers = top_risers[:100]
+                        for row_idx, pair in enumerate(chunked_rows(display_risers, 2)):
+                            cols = st.columns(2, vertical_alignment="center", gap="small")
+                            for i, item in enumerate(pair):
+                                rank = row_idx * 2 + i + 1
+                                query_value = quote_plus(str(item.get("symbol") or item["name"]))
+                                cols[i].markdown(
+                                    f"""
+                                    <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fffefe; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
+                                      <a class='mover-row-link' href='?q={query_value}' style="width:100%;">
+                                        <span class='rank-pill'>{rank}</span>
+                                        <span class='mover-name-text'>{item['name']}</span>
+                                        <span class='pct-up'>+{float(item['change_pct']):.2f}%</span>
+                                      </a>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                else:
+                    st.caption("급등 종목 데이터를 아직 불러오지 못했습니다.")
+
+        with mover_right:
+            with st.container(border=True, key="mover-panel-down"):
+                st.markdown(
+                    "<div class='mover-head-row'><h4 class='market-title'>〽 시장 급락 종목 TOP 100</h4></div>",
+                    unsafe_allow_html=True,
+                )
+                if top_fallers:
+                    with st.container(height=206, border=False, key="mover-list-down"):
+                        display_fallers = top_fallers[:100]
+                        for row_idx, pair in enumerate(chunked_rows(display_fallers, 2)):
+                            cols = st.columns(2, vertical_alignment="center", gap="small")
+                            for i, item in enumerate(pair):
+                                rank = row_idx * 2 + i + 1
+                                query_value = quote_plus(str(item.get("symbol") or item["name"]))
+                                cols[i].markdown(
+                                    f"""
+                                    <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fcfdff; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
+                                      <a class='mover-row-link' href='?q={query_value}' style="width:100%;">
+                                        <span class='rank-pill'>{rank}</span>
+                                        <span class='mover-name-text'>{item['name']}</span>
+                                        <span class='pct-down'>{float(item['change_pct']):.2f}%</span>
+                                      </a>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                else:
+                    st.caption("급락 종목 데이터를 아직 불러오지 못했습니다.")
+
 if effective_run or st.session_state.get("last_match"):
     st.session_state["auto_search"] = False
     if effective_run:
-        if not query.strip():
+        if not effective_query.strip():
             st.warning("종목명 또는 코드를 입력해 주세요.")
             st.stop()
         try:
-            match = search_symbol(query)
+            match = search_symbol(effective_query)
             if not match:
                 st.error("해당 종목을 찾지 못했습니다.")
                 st.stop()
@@ -572,6 +1381,21 @@ if effective_run or st.session_state.get("last_match"):
     financial_table = st.session_state.get("last_financial_table", [])
     if match and snapshot:
         try:
+                nav_left, nav_right = st.columns([6, 1])
+                with nav_right:
+                    if st.button("홈으로", key="go_home", use_container_width=True):
+                        st.session_state["query_input"] = ""
+                        st.session_state["auto_search"] = False
+                        st.session_state["pending_query"] = None
+                        st.session_state["last_match"] = None
+                        st.session_state["last_snapshot"] = None
+                        st.session_state["last_news_items"] = []
+                        st.session_state["last_related"] = []
+                        st.session_state["last_extra"] = {}
+                        st.session_state["last_peers"] = []
+                        st.session_state["last_financial_table"] = []
+                        st.rerun()
+
                 st.markdown(
                     f"""
                     <div class="quote-card">

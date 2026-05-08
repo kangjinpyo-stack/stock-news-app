@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+from io import StringIO
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,7 @@ import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 WIKIPEDIA_API_KO = "https://ko.wikipedia.org/api/rest_v1/page/summary/"
@@ -18,17 +20,17 @@ WIKIPEDIA_API_EN = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 THEME_MAP_PATH = "krx_theme_map.json"
 THEME_ONTOLOGY_PATH = "theme_ontology.json"
 AUTO_THEME_RULES: Dict[str, List[str]] = {
-    "2차전지": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "셀"],
+    "2차전지": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "배터리셀"],
     "반도체": ["반도체", "메모리", "파운드리", "후공정", "전공정", "칩", "웨이퍼"],
     "HBM": ["hbm", "고대역폭메모리", "3d 적층", "2.5d", "advanced packaging"],
     "유리기판": ["유리기판", "글라스기판", "tgv", "패키징기판", "반도체기판"],
     "AI": ["ai", "인공지능", "llm", "gpu", "데이터센터", "클라우드"],
     "바이오": ["바이오", "제약", "항체", "의약품", "cdmo", "백신", "신약"],
     "정유화학": ["정유", "석유", "석유화학", "윤활유", "아스팔트", "납사", "정제품"],
-    "로봇": ["로봇", "자동화", "협동로봇", "모빌리티"],
+    "로봇": ["로봇", "자동화", "협동로봇", "액추에이터", "로보틱스"],
     "전력인프라": ["변압기", "전력", "전선", "배전", "송전", "전력기기"],
     "전기차": ["전기차", "ev", "자율주행", "충전"],
-    "인터넷플랫폼": ["플랫폼", "포털", "커머스", "메신저", "콘텐츠"],
+    "인터넷플랫폼": ["포털", "검색", "커머스", "메신저", "콘텐츠", "카카오톡"],
 }
 
 THEME_EXCLUSIVE_GROUPS: Dict[str, str] = {
@@ -44,6 +46,26 @@ THEME_EXCLUSIVE_GROUPS: Dict[str, str] = {
     "정유화학": "energy",
     "로봇": "robotics",
 }
+MARKET_MOVER_EXCLUDE_KEYWORDS = [
+    "KODEX",
+    "TIGER",
+    "ACE",
+    "HANARO",
+    "ARIRANG",
+    "KOSEF",
+    "KBSTAR",
+    "TIMEFOLIO",
+    "RISE",
+    "PLUS",
+    "SOL",
+    "1Q",
+    "TREX",
+    "ETF",
+    "ETN",
+    "레버리지",
+    "인버스",
+    "선물",
+]
 THEME_WEIGHT_CORE = 4.0
 THEME_WEIGHT_NEWS = 0.6
 THEME_WEIGHT_MAPPED = 3.0
@@ -53,6 +75,17 @@ RELATED_SCORE_KEYWORD = 12
 RELATED_SCORE_ONTOLOGY = 7
 RELATED_SCORE_MAPPED = 8
 RELATED_SCORE_NEWS = 2
+GENERIC_RELATED_THEMES = {
+    "반도체",
+    "2차전지",
+    "AI",
+    "바이오",
+    "로봇",
+    "전기차",
+    "정유화학",
+    "인터넷플랫폼",
+    "전력인프라",
+}
 GLOBAL_SEED_TICKERS: List[str] = [
     "AAPL",
     "MSFT",
@@ -145,13 +178,183 @@ def get_krx_desc_listing() -> Any:
 @lru_cache(maxsize=1)
 def load_krx_theme_map() -> Dict[str, List[str]]:
     try:
-        with open(THEME_MAP_PATH, "r", encoding="utf-8") as f:
+        with open(THEME_MAP_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return {str(k): [str(t) for t in v] for k, v in data.items() if isinstance(v, list)}
     except Exception:
         pass
     return {}
+
+
+THEME_ALIAS_MAP: Dict[str, str] = {
+    "배터리셀": "2차전지",
+    "배터리소재": "2차전지",
+    "전해액": "2차전지",
+    "양극재": "2차전지",
+    "음극재": "2차전지",
+    "분리막": "2차전지",
+    "전기차": "2차전지",
+    "메모리": "반도체",
+    "장비": "반도체",
+    "전공정": "반도체",
+    "후공정": "반도체",
+    "인터넷": "인터넷플랫폼",
+    "플랫폼": "인터넷플랫폼",
+    "포털": "인터넷플랫폼",
+    "CDMO": "바이오",
+    "제약": "바이오",
+    "헬스케어": "바이오",
+    "화학": "정유화학",
+}
+
+
+def normalize_theme_label(theme: str) -> str:
+    text = to_text(theme).strip()
+    return THEME_ALIAS_MAP.get(text, text)
+
+
+def is_equity_like_name(name: str) -> bool:
+    text = to_text(name).strip().upper()
+    if not text:
+        return False
+    return not any(keyword.upper() in text for keyword in MARKET_MOVER_EXCLUDE_KEYWORDS)
+
+
+def get_theme_map_name_lookup() -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    try:
+        desc = get_krx_desc_listing()
+        if not desc.empty:
+            for _, row in desc.iterrows():
+                code = to_text(row.get("Code")).strip()
+                name = to_text(row.get("Name")).strip()
+                if code and name and code not in lookup:
+                    lookup[code] = name
+    except Exception:
+        pass
+    try:
+        listing = get_krx_listing()
+        if not listing.empty:
+            for _, row in listing.iterrows():
+                code = to_text(row.get("Code")).strip()
+                name = to_text(row.get("Name")).strip()
+                if code and name and code not in lookup:
+                    lookup[code] = name
+    except Exception:
+        pass
+    return lookup
+
+
+def fetch_naver_quote_change(symbol: str) -> Optional[Dict[str, Any]]:
+    if not symbol or not re.fullmatch(r"\d{6}", str(symbol).strip()):
+        return None
+    try:
+        disable_broken_proxy_env()
+        r = requests.get(
+            f"https://finance.naver.com/item/main.naver?code={symbol}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.encoding = r.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        price_block = soup.select_one("p.no_today")
+        change_block = soup.select_one("p.no_exday")
+        name_block = soup.select_one("div.wrap_company h2 a")
+        if price_block is None or change_block is None:
+            return None
+
+        price_blind = price_block.select_one("span.blind")
+        change_blinds = change_block.select("span.blind")
+        em = change_block.select_one("em")
+        if price_blind is None or len(change_blinds) < 2 or em is None:
+            return None
+
+        latest_close = float(str(price_blind.get_text(strip=True)).replace(",", ""))
+        abs_change = float(str(change_blinds[0].get_text(strip=True)).replace(",", ""))
+        pct_change = float(str(change_blinds[1].get_text(strip=True)).replace(",", ""))
+        em_classes = set(em.get("class", []))
+        if "no_down" in em_classes:
+            pct_change *= -1
+            abs_change *= -1
+        elif "no_up" in em_classes:
+            pct_change *= 1
+            abs_change *= 1
+        else:
+            pct_change = 0.0
+            abs_change = 0.0
+
+        return {
+            "name": to_text(name_block.get_text(strip=True)) if name_block is not None else symbol,
+            "latest_close": latest_close,
+            "change_pct": round(pct_change, 2),
+            "change_abs": round(abs_change, 2),
+        }
+    except Exception:
+        return None
+
+
+def fetch_naver_market_movers(direction: str = "rise", market: str = "KOSPI", limit: int = 12) -> List[Dict[str, Any]]:
+    page_name = "sise_rise.naver" if direction == "rise" else "sise_fall.naver"
+    sosok = "0" if market.upper() == "KOSPI" else "1"
+    try:
+        disable_broken_proxy_env()
+        url = f"https://finance.naver.com/sise/{page_name}?sosok={sosok}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.encoding = "euc-kr"
+        tables = pd.read_html(StringIO(r.text))
+        if len(tables) < 2:
+            return []
+        df = tables[1].copy()
+        if "종목명" not in df.columns or "등락률" not in df.columns:
+            return []
+        df = df.dropna(subset=["종목명", "등락률"])
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        code_map: Dict[str, str] = {}
+        for a in soup.select("table.type_2 a.tltle"):
+            name = a.get_text(strip=True)
+            href = a.get("href", "")
+            m = re.search(r"code=(\d{6})", href)
+            if name and m:
+                code_map[name] = m.group(1)
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            name = to_text(row.get("종목명")).strip()
+            if not is_equity_like_name(name):
+                continue
+            rate_text = to_text(row.get("등락률")).replace("%", "").replace("+", "").replace(",", "").strip()
+            price_text = to_text(row.get("현재가")).replace(",", "").strip()
+            try:
+                change_pct = float(rate_text)
+                if direction != "rise":
+                    change_pct = -abs(change_pct)
+                current_price = float(price_text)
+            except Exception:
+                continue
+            rows.append(
+                {
+                    "symbol": code_map.get(name, ""),
+                    "name": name,
+                    "change_pct": round(change_pct, 2),
+                    "latest_close": current_price,
+                    "market": market.upper(),
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+    except Exception:
+        return []
+
+
+def get_market_wide_movers(limit_each_market: int = 60, top_n: int = 100) -> Dict[str, List[Dict[str, Any]]]:
+    risers = fetch_naver_market_movers("rise", "KOSPI", limit_each_market) + fetch_naver_market_movers("rise", "KOSDAQ", limit_each_market)
+    fallers = fetch_naver_market_movers("fall", "KOSPI", limit_each_market) + fetch_naver_market_movers("fall", "KOSDAQ", limit_each_market)
+    risers = sorted(risers, key=lambda x: -float(x.get("change_pct", 0)))[:top_n]
+    fallers = sorted(fallers, key=lambda x: float(x.get("change_pct", 0)))[:top_n]
+    return {"rise": risers, "fall": fallers}
 
 
 def get_krx_profile_by_code(symbol: str) -> Dict[str, Any]:
@@ -170,23 +373,77 @@ def get_krx_profile_by_code(symbol: str) -> Dict[str, Any]:
     }
 
 
+def infer_common_stock_name(name: str) -> str:
+    text = to_text(name).strip()
+    if not text:
+        return ""
+    candidates = [
+        re.sub(r"우[A-Z]?$", "", text),
+        re.sub(r"\d+우[A-Z]?$", "", text),
+        re.sub(r"우선주$", "", text),
+    ]
+    for cand in candidates:
+        cand = cand.strip()
+        if cand and cand != text:
+            return cand
+    return ""
+
+
+def get_preferred_parent_match(symbol: str = "", name: str = "") -> Optional[Dict[str, Any]]:
+    try:
+        listing = get_krx_listing()
+        if listing.empty:
+            return None
+        row_name = to_text(name).strip()
+        if symbol:
+            m = listing[listing["Code"].astype(str) == str(symbol)]
+            if not m.empty:
+                row_name = to_text(m.iloc[0].get("Name", row_name)).strip()
+        base_name = infer_common_stock_name(row_name)
+        if not base_name:
+            return None
+        m_base = listing[listing["Name"].astype(str) == base_name]
+        if m_base.empty:
+            m_base = listing[
+                listing["Name"].astype(str).str.startswith(base_name, na=False)
+                & ~listing["Name"].astype(str).str.contains("우", na=False)
+            ]
+        if m_base.empty:
+            return None
+        base_row = m_base.iloc[0]
+        base_symbol = to_text(base_row.get("Code")).strip()
+        base_profile = get_krx_profile_by_code(base_symbol)
+        return {
+            "symbol": base_symbol,
+            "name": to_text(base_row.get("Name")).strip() or base_name,
+            "exchange": to_text(base_row.get("Market")).strip(),
+            "sector": base_profile.get("sector"),
+            "industry": base_profile.get("industry"),
+            "products": base_profile.get("products"),
+        }
+    except Exception:
+        return None
+
+
 def looks_like_krx_code(query: str) -> bool:
-    return bool(re.fullmatch(r"\d{6}(?:\.K[QS])?", query.strip().upper()))
+    text = to_text(query).strip().upper()
+    return bool(re.fullmatch(r"\d{6}(?:\.K[QS])?", text))
 
 
 def looks_like_global_ticker(query: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,9}", query.strip()))
+    text = to_text(query).strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,9}", text))
 
 
 def normalize_query_text(query: str) -> str:
-    cleaned = query.strip()
+    cleaned = to_text(query).strip()
     while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
         cleaned = cleaned[1:-1].strip()
     return cleaned
 
 
 def normalize_krx_symbol(query: str) -> str:
-    raw = query.strip().upper()
+    raw = to_text(query).strip().upper()
     if raw.endswith(".KS") or raw.endswith(".KQ"):
         return raw.split(".")[0]
     return raw
@@ -205,27 +462,37 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
             m = listing[listing["Code"] == symbol]
             if not m.empty:
                 row = m.iloc[0]
+                parent = None
+                if not to_text(profile.get("industry")).strip() or not to_text(profile.get("products")).strip():
+                    parent = get_preferred_parent_match(symbol=symbol, name=row.get("Name", ""))
                 return {
                     "symbol": symbol,
                     "name": profile.get("name") or row.get("Name", symbol),
                     "exchange": str(row.get("Market", "N/A")),
                     "market_type": "KRX",
-                    "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
-                    "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
-                    "industry": profile.get("industry"),
-                    "products": profile.get("products"),
+                    "sector": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("sector"),
+                    "market_dept": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("market_dept"),
+                    "industry": profile.get("industry") or (parent or {}).get("industry"),
+                    "products": profile.get("products") or (parent or {}).get("products"),
+                    "base_symbol": (parent or {}).get("symbol"),
+                    "base_name": (parent or {}).get("name"),
                 }
         except Exception:
             pass
+        parent = None
+        if not to_text(profile.get("industry")).strip() or not to_text(profile.get("products")).strip():
+            parent = get_preferred_parent_match(symbol=symbol, name=profile.get("name") or symbol)
         return {
             "symbol": symbol,
             "name": profile.get("name") or symbol,
             "exchange": "KRX",
             "market_type": "KRX",
-            "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
-            "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
-            "industry": profile.get("industry"),
-            "products": profile.get("products"),
+            "sector": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("sector"),
+            "market_dept": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("market_dept"),
+            "industry": profile.get("industry") or (parent or {}).get("industry"),
+            "products": profile.get("products") or (parent or {}).get("products"),
+            "base_symbol": (parent or {}).get("symbol"),
+            "base_name": (parent or {}).get("name"),
         }
 
     try:
@@ -236,15 +503,20 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
         if not m.empty:
             row = m.iloc[0]
             profile = get_krx_profile_by_code(row["Code"])
+            parent = None
+            if not to_text(profile.get("industry")).strip() or not to_text(profile.get("products")).strip():
+                parent = get_preferred_parent_match(symbol=row["Code"], name=row.get("Name", ""))
             return {
                 "symbol": row["Code"],
                 "name": profile.get("name") or row.get("Name", row["Code"]),
                 "exchange": str(row.get("Market", "N/A")),
                 "market_type": "KRX",
-                "sector": normalize_sector_for_display(profile.get("sector")).get("sector"),
-                "market_dept": normalize_sector_for_display(profile.get("sector")).get("market_dept"),
-                "industry": profile.get("industry"),
-                "products": profile.get("products"),
+                "sector": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("sector"),
+                "market_dept": normalize_sector_for_display(profile.get("sector") or (parent or {}).get("sector")).get("market_dept"),
+                "industry": profile.get("industry") or (parent or {}).get("industry"),
+                "products": profile.get("products") or (parent or {}).get("products"),
+                "base_symbol": (parent or {}).get("symbol"),
+                "base_name": (parent or {}).get("name"),
             }
     except Exception:
         pass
@@ -257,23 +529,41 @@ def search_symbol(query: str) -> Optional[Dict[str, str]]:
 
 
 def get_stock_snapshot_krx(symbol: str) -> Dict[str, Any]:
-    hist = fdr.DataReader(symbol, start=(dt.datetime.now() - dt.timedelta(days=400)).strftime("%Y-%m-%d"))
-    if hist.empty:
-        raise ValueError("가격 데이터를 가져오지 못했습니다.")
-    latest = hist.iloc[-1]
-    prev = hist.iloc[-2] if len(hist) > 1 else None
-    latest_close = float(latest["Close"])
-    change_pct = None if prev is None or float(prev["Close"]) == 0 else ((latest_close - float(prev["Close"])) / float(prev["Close"])) * 100
-    return {
-        "symbol": symbol,
-        "latest_close": latest_close,
-        "change_pct": change_pct,
-        "fifty_two_week_high": float(hist["High"].tail(252).max()),
-        "fifty_two_week_low": float(hist["Low"].tail(252).min()),
-        "volume": float(latest["Volume"]),
-        "currency": "KRW",
-        "company_description": "국내 상장 기업(KRX) 데이터",
-    }
+    disable_broken_proxy_env()
+    try:
+        hist = fdr.DataReader(symbol, start=(dt.datetime.now() - dt.timedelta(days=400)).strftime("%Y-%m-%d"))
+        if hist.empty:
+            raise ValueError("가격 데이터를 가져오지 못했습니다.")
+        latest = hist.iloc[-1]
+        prev = hist.iloc[-2] if len(hist) > 1 else None
+        latest_close = float(latest["Close"])
+        change_pct = None if prev is None or float(prev["Close"]) == 0 else ((latest_close - float(prev["Close"])) / float(prev["Close"])) * 100
+        return {
+            "symbol": symbol,
+            "latest_close": latest_close,
+            "change_pct": change_pct,
+            "fifty_two_week_high": float(hist["High"].tail(252).max()),
+            "fifty_two_week_low": float(hist["Low"].tail(252).min()),
+            "volume": float(latest["Volume"]),
+            "currency": "KRW",
+            "company_description": "국내 상장 기업(KRX) 데이터",
+        }
+    except Exception:
+        quote = fetch_naver_quote_change(symbol) or {}
+        if not quote:
+            raise
+        latest_close = quote.get("latest_close")
+        return {
+            "symbol": symbol,
+            "latest_close": latest_close,
+            "change_pct": quote.get("change_pct"),
+            "fifty_two_week_high": latest_close,
+            "fifty_two_week_low": latest_close,
+            "volume": None,
+            "currency": "KRW",
+            "company_description": "국내 상장 기업(KRX) 데이터",
+            "company_name": quote.get("name") or symbol,
+        }
 
 
 def get_stock_snapshot_global(symbol: str) -> Dict[str, Any]:
@@ -431,7 +721,20 @@ def enrich_company_profile(match: Dict[str, Any], snapshot: Dict[str, Any]) -> D
     profile.setdefault("sector", match.get("sector"))
     profile.setdefault("industry", match.get("industry"))
     profile.setdefault("products", match.get("products"))
-    naver_overview = fetch_naver_company_overview(str(match.get("symbol", "")))
+    lookup_symbol = str(match.get("symbol", ""))
+    parent = None
+    if not to_text(profile.get("industry")).strip() or not to_text(profile.get("products")).strip():
+        parent = get_preferred_parent_match(symbol=lookup_symbol, name=match.get("name", ""))
+        if parent:
+            profile["industry"] = profile.get("industry") or parent.get("industry")
+            profile["products"] = profile.get("products") or parent.get("products")
+    naver_overview = fetch_naver_company_overview(lookup_symbol)
+    if parent and (not naver_overview.get("company_description") or not naver_overview.get("products_text")):
+        parent_overview = fetch_naver_company_overview(str(parent.get("symbol", "")))
+        if not naver_overview.get("company_description") and parent_overview.get("company_description"):
+            naver_overview["company_description"] = parent_overview["company_description"]
+        if not naver_overview.get("products_text") and parent_overview.get("products_text"):
+            naver_overview["products_text"] = parent_overview["products_text"]
     if naver_overview.get("company_description"):
         profile["company_description"] = naver_overview["company_description"]
     if (not to_text(profile.get("products")).strip()) and naver_overview.get("products_text"):
@@ -484,7 +787,6 @@ def build_theme_keyword_bank() -> Dict[str, List[str]]:
             continue
         merged = list(bank.get(name, []))
         merged.extend([to_text(x) for x in item.get("core_keywords", []) if to_text(x)])
-        merged.extend([to_text(x) for x in item.get("value_chain", []) if to_text(x)])
         deduped: List[str] = []
         for kw in merged:
             if kw and kw not in deduped:
@@ -604,8 +906,6 @@ def has_business_theme_alignment(theme: str, theme_data: Dict[str, Any], company
     core_hits = theme_data.get("core_hits", []) or []
     if core_hits:
         return True
-    if theme_data.get("mapped"):
-        return True
     company_lower = to_text(company_text).lower()
     stricter_checks = {
         "2차전지": ["배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "셀"],
@@ -614,6 +914,11 @@ def has_business_theme_alignment(theme: str, theme_data: Dict[str, Any], company
         "반도체": ["반도체", "메모리", "웨이퍼", "파운드리", "후공정", "전공정"],
         "HBM": ["hbm", "고대역폭메모리", "advanced packaging", "3d 적층", "2.5d"],
         "유리기판": ["유리기판", "글라스기판", "tgv", "패키징기판"],
+        "AI": ["ai", "인공지능", "llm", "gpu", "데이터센터", "클라우드"],
+        "인터넷플랫폼": ["플랫폼", "포털", "커머스", "메신저", "콘텐츠", "검색"],
+        "바이오": ["바이오", "제약", "의약품", "cdmo", "항체", "백신", "신약"],
+        "로봇": ["로봇", "자동화", "협동로봇", "액추에이터", "로보틱스"],
+        "전력인프라": ["변압기", "전력", "전선", "배전", "송전", "전력기기"],
     }
     required = stricter_checks.get(theme, [])
     return any(token.lower() in company_lower for token in required)
@@ -663,10 +968,45 @@ def categorize_relation_bucket(themes: List[str], industry: str = "", products: 
     return "기타 관련주"
 
 
+def refine_related_display_themes(shared_themes: List[str], base_focus_themes: List[str], cand_focus_themes: List[str]) -> List[str]:
+    ordered = []
+    for theme in shared_themes:
+        theme_name = normalize_theme_label(theme)
+        if theme_name and theme_name not in ordered:
+            ordered.append(theme_name)
+
+    if not ordered:
+        return []
+
+    shared_focus = set(base_focus_themes).intersection(set(cand_focus_themes))
+    focus_specific = [t for t in ordered if t in shared_focus and t not in GENERIC_RELATED_THEMES]
+    if focus_specific:
+        return focus_specific[:3]
+
+    specific = [t for t in ordered if t not in GENERIC_RELATED_THEMES]
+    if specific:
+        return specific[:3]
+
+    focus_generic = [t for t in ordered if t in shared_focus]
+    if focus_generic:
+        return focus_generic[:3]
+
+    return ordered[:3]
+
+
+def fallback_related_display_themes(shared_themes: List[str]) -> List[str]:
+    ordered = []
+    for theme in shared_themes:
+        theme_name = normalize_theme_label(theme)
+        if theme_name and theme_name not in ordered:
+            ordered.append(theme_name)
+    return ordered[:3]
+
+
 @lru_cache(maxsize=1)
 def load_theme_ontology() -> Dict[str, Any]:
     try:
-        with open(THEME_ONTOLOGY_PATH, "r", encoding="utf-8") as f:
+        with open(THEME_ONTOLOGY_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return data
@@ -830,6 +1170,18 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
                 if has_business_theme_alignment(theme, cand_score_map.get(theme, {}), candidate_text)
             ]
             overlap = sorted(set(base_focus_themes).intersection(set(cand_focus_themes)))
+            cand_tokens = set(
+                tokenize_kr_text(" ".join([to_text(name), to_text(industry), to_text(products), to_text(sector)]))
+            )
+            text_overlap = len(base_tokens.intersection(cand_tokens))
+            mapped_focus_overlap = len(
+                {
+                    theme
+                    for theme in set(themes).intersection(set(base_focus_themes))
+                    if has_business_theme_alignment(theme, base_score_map.get(theme, {}), base_text)
+                    and has_business_theme_alignment(theme, cand_score_map.get(theme, {}), candidate_text)
+                }
+            )
             broad_overlap = sorted(
                 theme
                 for theme in base_themes.intersection(set(cand_score_map.keys()))
@@ -860,18 +1212,24 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             if not overlap and co_mention_score < 1:
                 continue
             if not overlap and broad_overlap:
-                overlap = broad_overlap[:2]
+                refined_broad_overlap = refine_related_display_themes(broad_overlap, base_focus_themes, cand_focus_themes)
+                if refined_broad_overlap and (mapped_focus_overlap >= 1 or text_overlap >= 4 or co_mention_score >= 2):
+                    overlap = refined_broad_overlap[:2]
+                elif broad_overlap and (mapped_focus_overlap >= 1 or text_overlap >= 5 or co_mention_score >= 2):
+                    overlap = fallback_related_display_themes(broad_overlap)[:2]
             cand_groups = infer_theme_groups(list(cand_score_map.keys())) | infer_theme_groups_from_ontology(list(cand_score_map.keys()))
             if base_groups and cand_groups and base_groups.isdisjoint(cand_groups) and co_mention_score < 1:
                 continue
-            cand_tokens = set(
-                tokenize_kr_text(" ".join([to_text(name), to_text(industry), to_text(products), to_text(sector)]))
-            )
-            text_overlap = len(base_tokens.intersection(cand_tokens))
             if not overlap and co_mention_score >= 1:
                 if text_overlap < 3:
                     continue
                 overlap = ["뉴스동시언급"]
+            original_overlap = list(overlap)
+            overlap = refine_related_display_themes(overlap, base_focus_themes, cand_focus_themes)
+            if not overlap and original_overlap:
+                overlap = fallback_related_display_themes(original_overlap)
+            if not overlap:
+                continue
             keyword_overlap_count = 0
             matched_keywords: List[str] = []
             theme_reason_parts: List[str] = []
@@ -897,16 +1255,18 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             # 1) Prefer concrete business-keyword overlap on the selected focus themes.
             # 2) News co-mention alone should not create a relation unless there is at least
             #    weak business text overlap or mapped-theme support.
-            mapped_focus_overlap = len(
-                {
-                    theme
-                    for theme in set(theme_map.get(code, [])).intersection(set(base_focus_themes))
-                    if has_business_theme_alignment(theme, base_score_map.get(theme, {}), base_text)
-                }
-            )
             if keyword_overlap_count < 1 and co_mention_score < 1 and mapped_focus_overlap < 1:
                 continue
             if keyword_overlap_count < 1 and co_mention_score >= 1 and text_overlap < 3 and mapped_focus_overlap < 1:
+                continue
+            if (
+                overlap
+                and all(theme in GENERIC_RELATED_THEMES for theme in overlap)
+                and not set(base_focus_themes).intersection(set(cand_focus_themes))
+                and keyword_overlap_count < 1
+                and mapped_focus_overlap < 1
+                and text_overlap < 4
+            ):
                 continue
 
             # prioritize concrete product/industry overlap on the most likely theme
@@ -1003,10 +1363,121 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
 
 
 def get_recent_news(query: str, limit: int = 5) -> List[Dict[str, str]]:
-    r = requests.get(GOOGLE_NEWS_RSS, params={"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}, timeout=10)
-    r.raise_for_status()
-    feed = feedparser.parse(r.text)
-    return [{"title": e.get("title", "제목 없음"), "link": e.get("link", ""), "published": e.get("published", "")} for e in feed.entries[:limit]]
+    try:
+        disable_broken_proxy_env()
+        r = requests.get(GOOGLE_NEWS_RSS, params={"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}, timeout=10)
+        r.raise_for_status()
+        feed = feedparser.parse(r.text)
+        return [{"title": e.get("title", "제목 없음"), "link": e.get("link", ""), "published": e.get("published", "")} for e in feed.entries[:limit]]
+    except Exception:
+        return []
+
+
+def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) -> Dict[str, Any]:
+    theme_map = load_krx_theme_map()
+    if not theme_map:
+        return {"up": [], "down": [], "as_of": dt.datetime.now().strftime("%Y-%m-%d"), "error": "테마 맵이 비어 있습니다."}
+
+    name_lookup = get_theme_map_name_lookup()
+    theme_groups: Dict[str, List[Dict[str, Any]]] = {}
+    today_label = dt.datetime.now().strftime("%Y-%m-%d")
+    success_count = 0
+    fail_count = 0
+    last_error = ""
+
+    for code, themes in theme_map.items():
+        try:
+            quote = fetch_naver_quote_change(code)
+            if not quote:
+                fail_count += 1
+                continue
+            success_count += 1
+        except Exception as e:
+            fail_count += 1
+            last_error = str(e)
+            continue
+
+        profile = get_krx_profile_by_code(code)
+        overview = fetch_naver_company_overview(code)
+        business_text = " ".join(
+            [
+                to_text(quote.get("name", "")),
+                to_text(profile.get("industry", "")),
+                to_text(profile.get("products", "")),
+                to_text(overview.get("company_description", "")),
+                to_text(overview.get("products_text", "")),
+            ]
+        )
+        score_map = score_theme_evidence(
+            business_text,
+            mapped_themes=[normalize_theme_label(x) for x in themes],
+        )
+        normalized_mapped = []
+        for raw_theme in themes:
+            theme_name = normalize_theme_label(raw_theme)
+            if theme_name and theme_name not in normalized_mapped:
+                normalized_mapped.append(theme_name)
+        focus_themes = [
+            normalize_theme_label(theme)
+            for theme in select_focus_themes(score_map)
+            if has_business_theme_alignment(theme, score_map.get(theme, {}), business_text)
+        ]
+        theme_candidates: List[str] = []
+        for theme in focus_themes:
+            theme_name = normalize_theme_label(theme)
+            if theme_name and theme_name in normalized_mapped and theme_name not in theme_candidates:
+                theme_candidates.append(theme_name)
+        if not theme_candidates:
+            continue
+
+        item = {
+            "symbol": code,
+            "name": quote.get("name") or name_lookup.get(code, code),
+            "change_pct": round(float(quote.get("change_pct", 0.0)), 2),
+        }
+        for theme in theme_candidates[:1]:
+            theme_key = to_text(theme).strip()
+            if not theme_key:
+                continue
+            theme_groups.setdefault(theme_key, []).append(item)
+
+    summary_rows: List[Dict[str, Any]] = []
+    all_items: List[Dict[str, Any]] = []
+    for theme, members in theme_groups.items():
+        if len(members) < 2:
+            continue
+        ordered_members = sorted(members, key=lambda x: x["change_pct"], reverse=True)
+        avg_change = sum(x["change_pct"] for x in ordered_members) / len(ordered_members)
+        rising_count = len([x for x in ordered_members if x["change_pct"] > 0])
+        all_items.extend(ordered_members)
+        summary_rows.append(
+            {
+                "theme": theme,
+                "avg_change": round(avg_change, 2),
+                "rising_count": rising_count,
+                "member_count": len(ordered_members),
+                "members": ordered_members[:members_per_theme],
+                "all_members": ordered_members,
+            }
+        )
+
+    up_rows = [x for x in summary_rows if x["avg_change"] > 0]
+    down_rows = [x for x in summary_rows if x["avg_change"] < 0]
+    up_rows.sort(key=lambda x: (-x["avg_change"], -x["rising_count"], x["theme"]))
+    down_rows.sort(key=lambda x: (x["avg_change"], x["rising_count"], x["theme"]))
+
+    error_msg = ""
+    if success_count == 0:
+        error_msg = "오늘 테마 원본 가격 데이터를 가져오지 못했습니다. 현재 네트워크/프록시 설정으로 시세 조회가 차단되었을 수 있습니다."
+
+    return {
+        "up": up_rows[:limit_themes],
+        "down": down_rows[:limit_themes],
+        "all_items": all_items,
+        "as_of": today_label,
+        "error": error_msg,
+        "stats": {"success": success_count, "failed": fail_count},
+    }
 
 
 def infer_themes_from_news(query: str, limit: int = 12) -> Dict[str, Any]:
