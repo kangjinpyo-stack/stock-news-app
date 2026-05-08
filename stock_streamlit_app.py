@@ -58,7 +58,9 @@ if st.session_state.get("pending_query"):
 
 qp_query = st.query_params.get("q")
 if qp_query:
-    st.session_state["pending_query"] = str(qp_query)
+    normalized_q = qp_query[0] if isinstance(qp_query, list) else str(qp_query)
+    st.session_state["query_input"] = normalized_q
+    applied_pending_query = normalized_q
     st.session_state["auto_search"] = True
     st.query_params.clear()
 
@@ -562,6 +564,7 @@ st.markdown(
     }
     .hero-sub {
       margin-top: 8px;
+      margin-bottom: 10px;
       color: #5b6784;
       font-size: 1.03rem;
       font-weight: 500;
@@ -665,6 +668,13 @@ st.markdown(
       height: 40px;
       border-radius: 10px;
       padding: 0 12px;
+    }
+    [data-testid="column"] div[data-testid="stButton"] button[kind="secondary"] {
+      height: 34px !important;
+      min-width: 64px !important;
+      padding: 0 10px !important;
+      border-radius: 8px !important;
+      font-size: 0.86rem !important;
     }
     .quote-card {
       background: #ffffff;
@@ -1200,22 +1210,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.container(border=True):
-    head_left, head_right = st.columns([6.2, 1.6], vertical_alignment="top")
-    with head_left:
-        st.markdown(
-            "<h1 class='hero-title'>KRX Stock Pulse <span class='live-badge'>실시간</span></h1>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "<div class='hero-sub'>종목명 또는 종목코드로 주가와 최신 뉴스를 빠르게 조회합니다.</div>",
-            unsafe_allow_html=True,
-        )
-    with head_right:
-        st.caption(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        if st.button("새로고침", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+head_left, head_right = st.columns([6.2, 1.8], vertical_alignment="center")
+with head_left:
+    st.markdown(
+        "<h1 class='hero-title'>KRX Stock Pulse <span class='live-badge'>실시간</span></h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='hero-sub'>종목명 또는 종목코드로 주가와 최신 뉴스를 빠르게 조회합니다.</div>",
+        unsafe_allow_html=True,
+    )
+with head_right:
+    time_col, btn_col = st.columns([1.45, 1], vertical_alignment="center")
+    time_col.caption(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    if btn_col.button("새로고침", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 with st.form("search_form", clear_on_submit=False):
     col_in, col_btn = st.columns([5.2, 1], vertical_alignment="bottom")
