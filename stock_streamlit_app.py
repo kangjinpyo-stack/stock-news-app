@@ -1,8 +1,9 @@
 ﻿import datetime as dt
 from collections import OrderedDict
+from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor
 
 import re
-from urllib.parse import quote_plus
 
 import altair as alt
 import pandas as pd
@@ -65,6 +66,70 @@ if qp_query:
     st.query_params.clear()
 
 st.set_page_config(page_title="KRX Stock Pulse", page_icon="📊", layout="wide")
+
+_mover_click_bridge = st.components.v2.component(
+    "mover_click_bridge",
+    html="<div id='mover-click-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement, setTriggerValue } = component;
+      const doc = parentElement.ownerDocument;
+      const links = doc.querySelectorAll("a.mover-row-link[data-symbol]");
+      links.forEach((link) => {
+        if (link.dataset.boundClick === "1") return;
+        link.dataset.boundClick = "1";
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          const symbol = link.getAttribute("data-symbol") || "";
+          setTriggerValue("symbol_click", symbol);
+        });
+      });
+    }
+    """,
+)
+
+_related_click_bridge = st.components.v2.component(
+    "related_click_bridge",
+    html="<div id='related-click-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement, setTriggerValue } = component;
+      const doc = parentElement.ownerDocument;
+      const links = doc.querySelectorAll("a.rel-name-link[data-symbol]");
+      links.forEach((link) => {
+        if (!link.dataset.boundRelatedClick) {
+          link.addEventListener("click", (event) => {
+            event.preventDefault();
+            const symbol = link.dataset.symbol;
+            if (symbol) setTriggerValue("symbol_click", symbol);
+          });
+          link.dataset.boundRelatedClick = "1";
+        }
+      });
+      return () => {};
+    }
+    """,
+)
+
+_hero_click_bridge = st.components.v2.component(
+    "hero_click_bridge",
+    html="<div id='hero-click-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement, setTriggerValue } = component;
+      const doc = parentElement.ownerDocument;
+      const title = doc.querySelector("[data-hero-home='1']");
+      if (!title) return;
+      if (title.dataset.boundHeroClick === "1") return;
+      title.dataset.boundHeroClick = "1";
+      title.style.cursor = "pointer";
+      title.addEventListener("click", (e) => {
+        e.preventDefault();
+        setTriggerValue("go_home", true);
+      });
+    }
+    """,
+)
 
 
 def first_sentence(text: str, limit: int = 170) -> str:
@@ -371,14 +436,19 @@ def chunked_rows(items, per_row: int = 2):
     return [items[idx : idx + per_row] for idx in range(0, len(items), per_row)]
 
 
-def build_theme_bubble_style(avg_change: float, member_count: int) -> tuple[int, str, str]:
+def build_theme_bubble_style(avg_change: float, member_count: int, relative_strength: float = 0.5) -> tuple[int, str, str]:
     intensity = min(max(abs(avg_change), 0.0), 12.0) / 12.0
-    size = 96 + int(intensity * 116) + min(max(member_count, 1), 6) * 4
+    # Relative strength makes stronger themes clearly bigger within each lane.
+    rel = min(max(relative_strength, 0.0), 1.0)
+    size = 88 + int(rel * 120) + min(max(member_count, 1), 6) * 4
+    size = min(max(size, 88), 230)
     if avg_change >= 0:
-        bg = f"radial-gradient(circle at 30% 30%, rgba(255,250,250,0.98), rgba(254,202,202,{0.18 + 0.34 * intensity:.2f}) 42%, rgba(248,113,113,{0.28 + 0.40 * intensity:.2f}) 66%, rgba(220,38,38,{0.34 + 0.54 * intensity:.2f}) 100%)"
+        color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
+        bg = f"radial-gradient(circle at 30% 30%, rgba(255,250,250,0.98), rgba(254,202,202,{0.16 + 0.30 * color_intensity:.2f}) 42%, rgba(248,113,113,{0.24 + 0.42 * color_intensity:.2f}) 66%, rgba(220,38,38,{0.28 + 0.62 * color_intensity:.2f}) 100%)"
         text = "#7f1d1d" if intensity < 0.72 else "#fff7ed"
     else:
-        bg = f"radial-gradient(circle at 30% 30%, rgba(248,fb,255,0.98), rgba(191,219,254,{0.18 + 0.30 * intensity:.2f}) 42%, rgba(96,165,250,{0.26 + 0.36 * intensity:.2f}) 66%, rgba(29,78,216,{0.34 + 0.52 * intensity:.2f}) 100%)"
+        color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
+        bg = f"radial-gradient(circle at 30% 30%, rgba(248,251,255,0.98), rgba(191,219,254,{0.16 + 0.28 * color_intensity:.2f}) 42%, rgba(96,165,250,{0.24 + 0.40 * color_intensity:.2f}) 66%, rgba(29,78,216,{0.30 + 0.60 * color_intensity:.2f}) 100%)"
         text = "#1e3a8a" if intensity < 0.72 else "#eff6ff"
     return size, bg, text
 
@@ -393,11 +463,14 @@ def render_theme_bubble_cluster(rows, positive: bool = True) -> str:
         rows,
         key=lambda x: (abs(float(x.get('avg_change', 0))), int(x.get('member_count', 0))),
         reverse=True,
-    )[:6]
+    )[:12]
+    max_abs_change = max([abs(float(x.get("avg_change", 0))) for x in sorted_rows], default=1.0)
+    max_abs_change = max(max_abs_change, 0.1)
     for row in sorted_rows:
         avg_change = float(row.get("avg_change", 0))
         member_count = int(row.get("member_count", 0))
-        size, bg, text = build_theme_bubble_style(avg_change, member_count)
+        relative_strength = min(max(abs(avg_change) / max_abs_change, 0.0), 1.0)
+        size, bg, text = build_theme_bubble_style(avg_change, member_count, relative_strength)
         sign = "+" if avg_change > 0 else ""
         strength = min(max(abs(avg_change), 0.0), 12.0) / 12.0
         ring = 1 + int(strength * 3)
@@ -444,6 +517,10 @@ def collect_theme_leaderboard(theme_movers):
 def load_snapshot_cached(symbol: str, market_type: str):
     return enrich_company_profile({"symbol": symbol, "market_type": market_type}, get_stock_snapshot(symbol, market_type))
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_match_cached(query_text: str):
+    return search_symbol(query_text)
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_news_cached(news_query: str):
@@ -489,19 +566,19 @@ def load_financial_table_cached(symbol: str):
     return get_krx_financial_table(symbol)
 
 
-THEME_MOVER_CACHE_VERSION = "theme-v3"
+THEME_MOVER_CACHE_VERSION = "theme-v9"
 MARKET_MOVER_UI_VERSION = "bubble-v19"
-MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top100-v1"
+MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top64-v3"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_today_theme_movers_cached(_version: str = THEME_MOVER_CACHE_VERSION):
-    return get_today_theme_movers(limit_themes=4, members_per_theme=4)
+    return get_today_theme_movers(limit_themes=12, members_per_theme=6)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_market_wide_movers_cached(_version: str = MARKET_WIDE_MOVER_CACHE_VERSION):
-    return get_market_wide_movers(limit_each_market=60, top_n=100)
+    return get_market_wide_movers(limit_each_market=20, top_n=64)
 
 st.markdown(
     """
@@ -523,7 +600,7 @@ st.markdown(
     .block-container,
     [data-testid="stAppViewContainer"] > .main .block-container {
       max-width: 1180px;
-      padding-top: 1.2rem;
+      padding-top: 2.4rem;
       padding-bottom: 2rem;
     }
     .hero-shell {
@@ -638,6 +715,14 @@ st.markdown(
       box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
     }
     .rel-name { font-weight: 600; color: var(--ink); margin-right:8px; }
+    .rel-name-link,
+    .rel-name-link:visited,
+    .rel-name-link:hover,
+    .rel-name-link:active {
+      color: var(--ink) !important;
+      text-decoration: none !important;
+      font-weight: inherit;
+    }
     .rel-row { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; min-width:0; }
     .rel-main { min-width:0; flex:1; display:flex; align-items:center; gap:8px; overflow:hidden; }
     .rel-name { flex:0 0 auto; }
@@ -1194,6 +1279,40 @@ st.markdown(
     .st-key-mover-list-down div[data-testid="column"]:last-child > div {
       justify-content: flex-end !important;
     }
+    .st-key-mover-list-up div[data-testid="stButton"] > button {
+      width: 96% !important;
+      margin: 0 auto 4px auto !important;
+      border: 1px solid #eceff4 !important;
+      background: #fffefe !important;
+      color: #7f1d1d !important;
+      box-shadow: none !important;
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif !important;
+      font-size: 0.88rem !important;
+      font-weight: 700 !important;
+      text-align: left !important;
+      justify-content: flex-start !important;
+      padding: 0 10px !important;
+      height: 34px !important;
+      min-height: 34px !important;
+      border-radius: 0 !important;
+    }
+    .st-key-mover-list-down div[data-testid="stButton"] > button {
+      width: 96% !important;
+      margin: 0 auto 4px auto !important;
+      border: 1px solid #eceff4 !important;
+      background: #fcfdff !important;
+      color: #1e3a8a !important;
+      box-shadow: none !important;
+      font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif !important;
+      font-size: 0.88rem !important;
+      font-weight: 700 !important;
+      text-align: left !important;
+      justify-content: flex-start !important;
+      padding: 0 10px !important;
+      height: 34px !important;
+      min-height: 34px !important;
+      border-radius: 0 !important;
+    }
     @media (max-width: 900px) {
       .theme-bubble-grid { grid-template-columns: 1fr; }
       .theme-bubble-lane { min-height: 220px; }
@@ -1213,7 +1332,7 @@ st.markdown(
 head_left, head_right = st.columns([6.2, 1.8], vertical_alignment="center")
 with head_left:
     st.markdown(
-        "<h1 class='hero-title'>KRX Stock Pulse <span class='live-badge'>실시간</span></h1>",
+        "<h1 class='hero-title' data-hero-home='1'>KRX Stock Pulse <span class='live-badge'>실시간</span></h1>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1221,11 +1340,24 @@ with head_left:
         unsafe_allow_html=True,
     )
 with head_right:
-    time_col, btn_col = st.columns([1.45, 1], vertical_alignment="center")
-    time_col.caption(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    if btn_col.button("새로고침", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+    st.markdown(
+        f"<div style='text-align:right; color:#64748b; font-size:0.92rem;'>{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
+        unsafe_allow_html=True,
+    )
+
+hero_result = _hero_click_bridge(on_go_home_change=lambda: None, isolate_styles=False, key="hero-click-bridge")
+if getattr(hero_result, "go_home", None):
+    st.session_state["query_input"] = ""
+    st.session_state["auto_search"] = False
+    st.session_state["pending_query"] = None
+    st.session_state["last_match"] = None
+    st.session_state["last_snapshot"] = None
+    st.session_state["last_news_items"] = []
+    st.session_state["last_related"] = []
+    st.session_state["last_extra"] = {}
+    st.session_state["last_peers"] = []
+    st.session_state["last_financial_table"] = []
+    st.rerun()
 
 with st.form("search_form", clear_on_submit=False):
     col_in, col_btn = st.columns([5.2, 1], vertical_alignment="bottom")
@@ -1252,7 +1384,7 @@ if not effective_run and not st.session_state.get("last_match"):
             theme_movers.get("up", []) + theme_movers.get("down", []),
             key=lambda x: abs(float(x.get("avg_change", 0))),
             reverse=True,
-        )[:10]
+        )[:24]
         top_risers = market_wide_movers.get("rise", [])
         top_fallers = market_wide_movers.get("fall", [])
         up_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) >= 0]
@@ -1303,7 +1435,7 @@ if not effective_run and not st.session_state.get("last_match"):
                                 cols[i].markdown(
                                     f"""
                                     <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fffefe; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
-                                      <a class='mover-row-link' href='?q={query_value}' style="width:100%;">
+                                      <a class='mover-row-link' href='?q={query_value}' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
                                         <span class='rank-pill'>{rank}</span>
                                         <span class='mover-name-text'>{item['name']}</span>
                                         <span class='pct-up'>+{float(item['change_pct']):.2f}%</span>
@@ -1332,7 +1464,7 @@ if not effective_run and not st.session_state.get("last_match"):
                                 cols[i].markdown(
                                     f"""
                                     <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fcfdff; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
-                                      <a class='mover-row-link' href='?q={query_value}' style="width:100%;">
+                                      <a class='mover-row-link' href='?q={query_value}' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
                                         <span class='rank-pill'>{rank}</span>
                                         <span class='mover-name-text'>{item['name']}</span>
                                         <span class='pct-down'>{float(item['change_pct']):.2f}%</span>
@@ -1344,6 +1476,12 @@ if not effective_run and not st.session_state.get("last_match"):
                 else:
                     st.caption("급락 종목 데이터를 아직 불러오지 못했습니다.")
 
+        bridge_result = _mover_click_bridge(on_symbol_click_change=lambda: None, isolate_styles=False, key="mover-bridge")
+        if getattr(bridge_result, "symbol_click", None):
+            st.session_state["pending_query"] = bridge_result.symbol_click
+            st.session_state["auto_search"] = True
+            st.rerun()
+
 if effective_run or st.session_state.get("last_match"):
     st.session_state["auto_search"] = False
     if effective_run:
@@ -1351,26 +1489,32 @@ if effective_run or st.session_state.get("last_match"):
             st.warning("종목명 또는 코드를 입력해 주세요.")
             st.stop()
         try:
-            match = search_symbol(effective_query)
+            match = load_match_cached(effective_query)
             if not match:
                 st.error("해당 종목을 찾지 못했습니다.")
                 st.stop()
             snapshot = load_snapshot_cached(match["symbol"], match.get("market_type", "KRX"))
-            snapshot = enrich_company_profile(match, snapshot)
             news_query = match["name"] if match.get("market_type") == "KRX" else match["symbol"]
-            news_items = load_news_cached(news_query)
-            related = load_related_cached(
-                match["symbol"],
-                match["name"],
-                match.get("market_type", "KRX"),
-                match.get("exchange", ""),
-                snapshot.get("industry", "") or match.get("industry", "") or "",
-                snapshot.get("products", "") or match.get("products", "") or "",
-                snapshot.get("company_description", "") or "",
-            )
-            extra = load_extra_cached(match["symbol"]) if (match.get("market_type") or "").upper() != "GLOBAL" else {}
-            peers = load_peers_cached(match["symbol"]) if (match.get("market_type") or "").upper() != "GLOBAL" else []
-            financial_table = load_financial_table_cached(match["symbol"]) if (match.get("market_type") or "").upper() != "GLOBAL" else []
+            is_global = (match.get("market_type") or "").upper() == "GLOBAL"
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                f_news = executor.submit(load_news_cached, news_query)
+                f_related = executor.submit(
+                    load_related_cached,
+                    match["symbol"],
+                    match["name"],
+                    match.get("market_type", "KRX"),
+                    match.get("exchange", ""),
+                    snapshot.get("industry", "") or match.get("industry", "") or "",
+                    snapshot.get("products", "") or match.get("products", "") or "",
+                    snapshot.get("company_description", "") or "",
+                )
+                f_peers = executor.submit(load_peers_cached, match["symbol"]) if not is_global else None
+                f_financial = executor.submit(load_financial_table_cached, match["symbol"]) if not is_global else None
+                news_items = f_news.result()
+                related = f_related.result()
+                extra = {}
+                peers = f_peers.result() if f_peers else []
+                financial_table = f_financial.result() if f_financial else []
             st.session_state["last_match"] = match
             st.session_state["last_snapshot"] = snapshot
             st.session_state["last_news_items"] = news_items
@@ -1391,21 +1535,6 @@ if effective_run or st.session_state.get("last_match"):
     financial_table = st.session_state.get("last_financial_table", [])
     if match and snapshot:
         try:
-                nav_left, nav_right = st.columns([6, 1])
-                with nav_right:
-                    if st.button("홈으로", key="go_home", use_container_width=True):
-                        st.session_state["query_input"] = ""
-                        st.session_state["auto_search"] = False
-                        st.session_state["pending_query"] = None
-                        st.session_state["last_match"] = None
-                        st.session_state["last_snapshot"] = None
-                        st.session_state["last_news_items"] = []
-                        st.session_state["last_related"] = []
-                        st.session_state["last_extra"] = {}
-                        st.session_state["last_peers"] = []
-                        st.session_state["last_financial_table"] = []
-                        st.rerun()
-
                 st.markdown(
                     f"""
                     <div class="quote-card">
@@ -1519,7 +1648,6 @@ if effective_run or st.session_state.get("last_match"):
                     for group_label, group_items in grouped_related:
                         st.markdown(f"#### {group_label}")
                         for item in group_items:
-                            c_left, c_right = st.columns([4, 1])
                             theme_raw = int(item.get("theme_score", "0"))
                             keyword_raw = int(item.get("keyword_score", "0"))
                             theme_score = round((theme_raw / max_theme) * 5, 1)
@@ -1532,12 +1660,14 @@ if effective_run or st.session_state.get("last_match"):
                                 keyword_text = item.get("theme_reason", "").strip() or "사업/뉴스 연관도 기반"
                             origin_text = item.get("theme_origin", "").strip()
 
-                            c_left.markdown(
+                            st.markdown(
                                 f"""
                                 <div class="rel-card">
                                   <div class="rel-row">
                                     <div class="rel-main">
-                                      <div class="rel-name">{item['name']} ({item['symbol']})</div>
+                                      <div class="rel-name">
+                                        <a href="?q={item['symbol']}" class="rel-name-link" data-symbol="{item['symbol']}">{item['name']} ({item['symbol']})</a>
+                                      </div>
                                       <div class="rel-sub">주요제품/산업: {product_industry}</div>
                                       <div class="rel-sub">테마: {item.get('matched_themes', '')}</div>
                                       <div class="rel-sub">근거: {keyword_text}</div>
@@ -1560,10 +1690,11 @@ if effective_run or st.session_state.get("last_match"):
                                 """,
                                 unsafe_allow_html=True,
                             )
-                            if c_right.button("조회", key=f"rel_{group_label}_{item['symbol']}"):
-                                st.session_state["pending_query"] = item["symbol"]
-                                st.session_state["auto_search"] = True
-                                st.rerun()
+                    related_bridge_result = _related_click_bridge(on_symbol_click_change=lambda: None, isolate_styles=False, key="related-bridge")
+                    if getattr(related_bridge_result, "symbol_click", None):
+                        st.session_state["pending_query"] = related_bridge_result.symbol_click
+                        st.session_state["auto_search"] = True
+                        st.rerun()
                 else:
                     if match.get("market_type") == "KRX":
                         st.write("같은 산업/업종 기준 추천 종목이 없거나 데이터가 부족합니다.")

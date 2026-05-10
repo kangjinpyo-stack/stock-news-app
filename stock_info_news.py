@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -22,8 +23,8 @@ THEME_ONTOLOGY_PATH = "theme_ontology.json"
 AUTO_THEME_RULES: Dict[str, List[str]] = {
     "2차전지": ["2차전지", "배터리", "전해액", "양극재", "음극재", "분리막", "리튬", "배터리셀"],
     "반도체": ["반도체", "메모리", "파운드리", "후공정", "전공정", "칩", "웨이퍼"],
-    "HBM": ["hbm", "고대역폭메모리", "3d 적층", "2.5d", "advanced packaging"],
-    "유리기판": ["유리기판", "글라스기판", "tgv", "패키징기판", "반도체기판"],
+    "HBM": ["hbm", "고대역폭메모리", "고대역폭 메모리", "3d 적층", "2.5d", "advanced packaging", "어드밴스드 패키징"],
+    "유리기판": ["유리기판", "글라스기판", "글라스 코어", "유리 코어", "tgv", "패키징기판", "반도체기판", "glass core"],
     "AI": ["ai", "인공지능", "llm", "gpu", "데이터센터", "클라우드"],
     "바이오": ["바이오", "제약", "항체", "의약품", "cdmo", "백신", "신약"],
     "정유화학": ["정유", "석유", "석유화학", "윤활유", "아스팔트", "납사", "정제품"],
@@ -254,7 +255,7 @@ def fetch_naver_quote_change(symbol: str) -> Optional[Dict[str, Any]]:
         r = requests.get(
             f"https://finance.naver.com/item/main.naver?code={symbol}",
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
+            timeout=4,
         )
         r.encoding = r.apparent_encoding or "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
@@ -300,7 +301,7 @@ def fetch_naver_market_movers(direction: str = "rise", market: str = "KOSPI", li
     try:
         disable_broken_proxy_env()
         url = f"https://finance.naver.com/sise/{page_name}?sosok={sosok}"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
         r.encoding = "euc-kr"
         tables = pd.read_html(StringIO(r.text))
         if len(tables) < 2:
@@ -350,8 +351,27 @@ def fetch_naver_market_movers(direction: str = "rise", market: str = "KOSPI", li
 
 
 def get_market_wide_movers(limit_each_market: int = 60, top_n: int = 100) -> Dict[str, List[Dict[str, Any]]]:
-    risers = fetch_naver_market_movers("rise", "KOSPI", limit_each_market) + fetch_naver_market_movers("rise", "KOSDAQ", limit_each_market)
-    fallers = fetch_naver_market_movers("fall", "KOSPI", limit_each_market) + fetch_naver_market_movers("fall", "KOSDAQ", limit_each_market)
+    tasks = [
+        ("rise", "KOSPI"),
+        ("rise", "KOSDAQ"),
+        ("fall", "KOSPI"),
+        ("fall", "KOSDAQ"),
+    ]
+    fetched: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {
+            executor.submit(fetch_naver_market_movers, direction, market, limit_each_market): (direction, market)
+            for direction, market in tasks
+        }
+        for future in as_completed(future_map):
+            direction, market = future_map[future]
+            try:
+                fetched[(direction, market)] = future.result() or []
+            except Exception:
+                fetched[(direction, market)] = []
+
+    risers = fetched.get(("rise", "KOSPI"), []) + fetched.get(("rise", "KOSDAQ"), [])
+    fallers = fetched.get(("fall", "KOSPI"), []) + fetched.get(("fall", "KOSDAQ"), [])
     risers = sorted(risers, key=lambda x: -float(x.get("change_pct", 0)))[:top_n]
     fallers = sorted(fallers, key=lambda x: float(x.get("change_pct", 0)))[:top_n]
     return {"rise": risers, "fall": fallers}
@@ -768,6 +788,48 @@ def infer_themes_from_text(text: str) -> List[str]:
     return inferred
 
 
+@lru_cache(maxsize=1)
+def build_augmented_theme_map(max_codes: int = 36) -> Dict[str, List[str]]:
+    base_map = load_krx_theme_map()
+    merged: Dict[str, List[str]] = {code: [normalize_theme_label(t) for t in themes] for code, themes in base_map.items()}
+
+    try:
+        desc = get_krx_desc_listing()
+    except Exception:
+        return merged
+
+    if desc is None or desc.empty:
+        return merged
+
+    dynamic_candidates: List[tuple[str, List[str]]] = []
+    for _, row in desc.iterrows():
+        code = to_text(row.get("Code")).strip()
+        if not code or code in merged:
+            continue
+        text = " ".join(
+            [
+                to_text(row.get("Name", "")),
+                to_text(row.get("Sector", "")),
+                to_text(row.get("Industry", "")),
+                to_text(row.get("Products", "")),
+            ]
+        )
+        inferred = [normalize_theme_label(t) for t in infer_themes_from_text(text)]
+        deduped: List[str] = []
+        for t in inferred:
+            if t and t not in deduped:
+                deduped.append(t)
+        if deduped:
+            dynamic_candidates.append((code, deduped[:2]))
+
+    # Prefer entries with clearer multi-theme evidence, then stable code order.
+    dynamic_candidates.sort(key=lambda x: (-len(x[1]), x[0]))
+    remaining = max(max_codes - len(merged), 0)
+    for code, themes in dynamic_candidates[:remaining]:
+        merged[code] = themes
+    return merged
+
+
 def extract_theme_keyword_hits(text: str) -> Dict[str, set]:
     lowered = (text or "").lower()
     hits: Dict[str, set] = {}
@@ -880,7 +942,14 @@ def select_focus_themes(theme_scores: Dict[str, Dict[str, Any]]) -> List[str]:
                     or group in infer_theme_groups_from_ontology([other])
                 )
                 and ((other_data.get("core_hits", []) or []) or other_data.get("mapped"))
-                and float(other_data.get("score", 0)) >= float(data.get("score", 0)) * 0.65
+                and (
+                    float(other_data.get("score", 0)) >= float(data.get("score", 0)) * 0.65
+                    or (
+                        group == "semiconductor"
+                        and other in {"HBM", "유리기판"}
+                        and float(other_data.get("score", 0)) >= float(data.get("score", 0)) * 0.42
+                    )
+                )
                 for other, other_data in ranked
             )
             if more_specific_exists:
@@ -1111,17 +1180,7 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
     )
     base_theme_hits = extract_theme_keyword_hits(base_text)
     base_ontology_hits = extract_ontology_hits(base_text)
-    news_query = to_text(match.get("name")) or symbol
-    base_news_titles = get_news_titles_multi(
-        [
-            news_query,
-            f"{news_query} 관련주",
-            f"{news_query} 수혜주",
-            f"{news_query} 공급",
-            f"{news_query} 고객사",
-        ],
-        limit_each=8,
-    )
+    base_news_titles = []
     base_score_map = score_theme_evidence(
         base_text,
         news_titles=base_news_titles,
@@ -1132,6 +1191,17 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
         for theme in select_focus_themes(base_score_map)
         if has_business_theme_alignment(theme, base_score_map.get(theme, {}), base_text)
     ]
+    # If the base company text explicitly contains key subtheme tokens, keep that subtheme in focus.
+    forced_specific_themes: List[str] = []
+    base_text_lower = to_text(base_text).lower()
+    if any(token in base_text_lower for token in ["유리기판", "글라스기판", "글라스 코어", "유리 코어", "tgv", "glass core"]):
+        forced_specific_themes.append("유리기판")
+    if any(token in base_text_lower for token in ["hbm", "고대역폭메모리", "고대역폭 메모리", "3d 적층", "advanced packaging"]):
+        forced_specific_themes.append("HBM")
+    for theme in forced_specific_themes:
+        if theme not in base_focus_themes:
+            base_focus_themes.append(theme)
+    preferred_specific_semis = set(base_focus_themes).intersection({"HBM", "유리기판"})
     base_themes = set(base_score_map.keys())
     base_groups = infer_theme_groups(list(base_themes)) | infer_theme_groups_from_ontology(list(base_themes))
 
@@ -1143,8 +1213,6 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
         )
         scored: List[Dict[str, Any]] = []
         candidate_codes: set[str] = set(theme_map.keys())
-        if not desc.empty and "Code" in desc.columns:
-            candidate_codes |= set(desc["Code"].astype(str).tolist())
 
         for code in candidate_codes:
             if code == symbol:
@@ -1228,6 +1296,9 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
             overlap = refine_related_display_themes(overlap, base_focus_themes, cand_focus_themes)
             if not overlap and original_overlap:
                 overlap = fallback_related_display_themes(original_overlap)
+            if preferred_specific_semis and "반도체" in overlap and not set(overlap).intersection(preferred_specific_semis):
+                specific_theme = sorted(preferred_specific_semis)[0]
+                overlap = [specific_theme] + [t for t in overlap if t != specific_theme][:2]
             if not overlap:
                 continue
             keyword_overlap_count = 0
@@ -1334,6 +1405,54 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
                 x["name"],
             )
         )
+        if len(scored) < limit and not desc.empty:
+            picked = {str(x.get("symbol", "")) for x in scored}
+            picked.add(symbol)
+            industry = to_text(match.get("industry", "")).strip()
+            sector = to_text(match.get("sector", "")).strip()
+            fallback_df = pd.DataFrame()
+            if industry:
+                fallback_df = desc[desc["Industry"] == industry]
+            if fallback_df.empty and sector:
+                fallback_df = desc[desc["Sector"] == sector]
+            if not fallback_df.empty:
+                for _, row in fallback_df.iterrows():
+                    code = str(row.get("Code", "")).strip()
+                    if not code or code in picked:
+                        continue
+                    scored.append(
+                        {
+                            "symbol": code,
+                            "name": str(row.get("Name", code)),
+                            "industry": str(row.get("Industry", "")),
+                            "products": str(row.get("Products", "")),
+                            "matched_themes": "업종 기반 보강",
+                            "relation_bucket": "기타 관련주",
+                            "theme_score": 0,
+                            "keyword_score": 0,
+                            "text_score": 0,
+                            "ontology_score": 0,
+                            "co_mention_score": 0,
+                            "theme_origin": "fallback",
+                            "matched_keywords": "",
+                            "theme_reason": "동일 업종/섹터 보강",
+                            "score": -1000,
+                        }
+                    )
+                    picked.add(code)
+                    if len(scored) >= limit:
+                        break
+            scored.sort(
+                key=lambda x: (
+                    -x["score"],
+                    -x["theme_score"],
+                    -x["keyword_score"],
+                    -x["ontology_score"],
+                    -x["co_mention_score"],
+                    -x["text_score"],
+                    x["name"],
+                )
+            )
         return [{k: str(v) for k, v in row.items() if k != "score"} for row in scored[:limit]]
 
     # fallback
@@ -1365,7 +1484,7 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
 def get_recent_news(query: str, limit: int = 5) -> List[Dict[str, str]]:
     try:
         disable_broken_proxy_env()
-        r = requests.get(GOOGLE_NEWS_RSS, params={"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}, timeout=10)
+        r = requests.get(GOOGLE_NEWS_RSS, params={"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}, timeout=4)
         r.raise_for_status()
         feed = feedparser.parse(r.text)
         return [{"title": e.get("title", "제목 없음"), "link": e.get("link", ""), "published": e.get("published", "")} for e in feed.entries[:limit]]
@@ -1374,7 +1493,7 @@ def get_recent_news(query: str, limit: int = 5) -> List[Dict[str, str]]:
 
 
 def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) -> Dict[str, Any]:
-    theme_map = load_krx_theme_map()
+    theme_map = build_augmented_theme_map(max_codes=36)
     if not theme_map:
         return {"up": [], "down": [], "as_of": dt.datetime.now().strftime("%Y-%m-%d"), "error": "테마 맵이 비어 있습니다."}
 
@@ -1385,27 +1504,34 @@ def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) ->
     fail_count = 0
     last_error = ""
 
-    for code, themes in theme_map.items():
-        try:
-            quote = fetch_naver_quote_change(code)
-            if not quote:
+    quotes_by_code: Dict[str, Dict[str, Any]] = {}
+    max_workers = min(max(len(theme_map), 1), 16)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(fetch_naver_quote_change, code): code for code in theme_map.keys()}
+        for future in as_completed(future_map):
+            code = future_map[future]
+            try:
+                quote = future.result()
+                if quote:
+                    quotes_by_code[code] = quote
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
                 fail_count += 1
-                continue
-            success_count += 1
-        except Exception as e:
-            fail_count += 1
-            last_error = str(e)
+                last_error = str(e)
+
+    for code, themes in theme_map.items():
+        quote = quotes_by_code.get(code)
+        if not quote:
             continue
 
         profile = get_krx_profile_by_code(code)
-        overview = fetch_naver_company_overview(code)
         business_text = " ".join(
             [
                 to_text(quote.get("name", "")),
                 to_text(profile.get("industry", "")),
                 to_text(profile.get("products", "")),
-                to_text(overview.get("company_description", "")),
-                to_text(overview.get("products_text", "")),
             ]
         )
         score_map = score_theme_evidence(
@@ -1435,7 +1561,7 @@ def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) ->
             "name": quote.get("name") or name_lookup.get(code, code),
             "change_pct": round(float(quote.get("change_pct", 0.0)), 2),
         }
-        for theme in theme_candidates[:1]:
+        for theme in theme_candidates[:2]:
             theme_key = to_text(theme).strip()
             if not theme_key:
                 continue
@@ -1444,7 +1570,7 @@ def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) ->
     summary_rows: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
     for theme, members in theme_groups.items():
-        if len(members) < 2:
+        if len(members) < 1:
             continue
         ordered_members = sorted(members, key=lambda x: x["change_pct"], reverse=True)
         avg_change = sum(x["change_pct"] for x in ordered_members) / len(ordered_members)
