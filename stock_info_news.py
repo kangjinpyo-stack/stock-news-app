@@ -1522,6 +1522,17 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
                 fail_count += 1
                 last_error = str(e)
 
+    def _append_to_theme_group(theme_name: str, item: Dict[str, Any]) -> None:
+        t = to_text(theme_name).strip()
+        if not t:
+            return
+        target = theme_groups_up if float(item.get("change_pct", 0.0)) > 0 else theme_groups_down
+        bucket = target.setdefault(t, [])
+        symbol = to_text(item.get("symbol")).strip()
+        if symbol and any(to_text(x.get("symbol")).strip() == symbol for x in bucket):
+            return
+        bucket.append(item)
+
     for code, themes in theme_map.items():
         quote = quotes_by_code.get(code)
         if not quote:
@@ -1567,13 +1578,7 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
             "change_pct": round(float(quote.get("change_pct", 0.0)), 2),
         }
         for theme in theme_candidates[:2]:
-            theme_key = to_text(theme).strip()
-            if not theme_key:
-                continue
-            if item["change_pct"] > 0:
-                theme_groups_up.setdefault(theme_key, []).append(item)
-            elif item["change_pct"] < 0:
-                theme_groups_down.setdefault(theme_key, []).append(item)
+            _append_to_theme_group(theme, item)
 
     def build_summary_rows(theme_groups: Dict[str, List[Dict[str, Any]]], is_up: bool) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1601,6 +1606,44 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
 
     up_rows = build_summary_rows(theme_groups_up, is_up=True)
     down_rows = build_summary_rows(theme_groups_down, is_up=False)
+
+    # Coverage fallback:
+    # When direct quote fetch success is low, supplement theme buckets from market-wide movers
+    # so that today's theme board does not collapse to just a few themes.
+    min_theme_rows = min(12, max(6, limit_themes // 2))
+    if len(up_rows) < min_theme_rows or len(down_rows) < min_theme_rows:
+        try:
+            movers = get_market_wide_movers(limit_each_market=120, top_n=120)
+            seed_items = (movers.get("rise") or []) + (movers.get("fall") or [])
+            for m in seed_items:
+                code = to_text(m.get("symbol")).strip()
+                if not code:
+                    continue
+                mapped = [normalize_theme_label(x) for x in theme_map.get(code, []) if normalize_theme_label(x)]
+                if not mapped:
+                    profile = get_krx_profile_by_code(code)
+                    business_text = " ".join(
+                        [
+                            to_text(m.get("name", "")),
+                            to_text(profile.get("industry", "")),
+                            to_text(profile.get("products", "")),
+                        ]
+                    )
+                    inferred = [normalize_theme_label(x) for x in infer_themes_from_text(business_text)]
+                    mapped = [x for x in inferred if x]
+                if not mapped:
+                    continue
+                item = {
+                    "symbol": code,
+                    "name": to_text(m.get("name", "")) or name_lookup.get(code, code),
+                    "change_pct": round(float(m.get("change_pct", 0.0)), 2),
+                }
+                for t in mapped[:2]:
+                    _append_to_theme_group(t, item)
+            up_rows = build_summary_rows(theme_groups_up, is_up=True)
+            down_rows = build_summary_rows(theme_groups_down, is_up=False)
+        except Exception:
+            pass
     all_items: List[Dict[str, Any]] = []
     for row in up_rows + down_rows:
         all_items.extend(row.get("all_members", []))

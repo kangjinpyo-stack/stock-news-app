@@ -110,11 +110,18 @@ _theme_click_bridge = st.components.v2.component(
       doc.__themeDelegationBound = true;
       doc.addEventListener("click", (e) => {
         const target = e.target.closest(".theme-bubble-link[data-theme-key]");
-        if (!target) return;
-        e.preventDefault();
-        e.stopPropagation();
-        const key = target.getAttribute("data-theme-key") || "";
-        if (key) setTriggerValue("theme_click", key);
+        if (target) {
+          e.preventDefault();
+          e.stopPropagation();
+          const key = target.getAttribute("data-theme-key") || "";
+          if (key) setTriggerValue("theme_click", key);
+          return;
+        }
+        const popup = e.target.closest(".theme-member-popup");
+        if (popup) return;
+        const board = e.target.closest(".theme-bubble-board");
+        if (!board) return;
+        setTriggerValue("theme_click", "__CLEAR__");
       }, true);
     }
     """,
@@ -1703,7 +1710,7 @@ if not effective_run and not st.session_state.get("last_match"):
             theme_movers.get("up", []) + theme_movers.get("down", []),
             key=lambda x: abs(float(x.get("avg_change", 0))),
             reverse=True,
-        )[:40]
+        )[:80]
         top_risers = market_wide_movers.get("rise", [])
         top_fallers = market_wide_movers.get("fall", [])
         up_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) >= 0]
@@ -1736,7 +1743,8 @@ if not effective_run and not st.session_state.get("last_match"):
             )
             theme_bridge_result = _theme_click_bridge(on_theme_click_change=lambda: None, isolate_styles=False, key="theme-bridge")
             if getattr(theme_bridge_result, "theme_click", None):
-                st.session_state["theme_popup_key"] = unquote_plus(str(theme_bridge_result.theme_click))
+                clicked = unquote_plus(str(theme_bridge_result.theme_click))
+                st.session_state["theme_popup_key"] = "" if clicked == "__CLEAR__" else clicked
                 st.rerun()
         else:
             st.caption("오늘 테마 맵을 아직 만들지 못했습니다.")
