@@ -2,6 +2,7 @@
 from collections import OrderedDict
 from urllib.parse import quote_plus, unquote_plus
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 import re
 
@@ -43,6 +44,8 @@ if "last_extra" not in st.session_state:
     st.session_state["last_extra"] = {}
 if "theme_popup_key" not in st.session_state:
     st.session_state["theme_popup_key"] = ""
+if "ai_detail_cache" not in st.session_state:
+    st.session_state["ai_detail_cache"] = {}
 
 applied_pending_query = ""
 pending_query = st.session_state.get("pending_query")
@@ -82,16 +85,16 @@ _mover_click_bridge = st.components.v2.component(
     export default function(component) {
       const { parentElement, setTriggerValue } = component;
       const doc = parentElement.ownerDocument;
-      const links = doc.querySelectorAll("a.mover-row-link[data-symbol]");
-      links.forEach((link) => {
-        if (link.dataset.boundClick === "1") return;
-        link.dataset.boundClick = "1";
-        link.addEventListener("click", (e) => {
-          e.preventDefault();
-          const symbol = link.getAttribute("data-symbol") || "";
-          setTriggerValue("symbol_click", symbol);
-        });
-      });
+      if (doc.__moverDelegationBound) return;
+      doc.__moverDelegationBound = true;
+      doc.addEventListener("click", (e) => {
+        const target = e.target.closest(".mover-row-link[data-symbol]");
+        if (!target) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const symbol = target.getAttribute("data-symbol") || "";
+        if (symbol) setTriggerValue("symbol_click", symbol);
+      }, true);
     }
     """,
 )
@@ -103,16 +106,16 @@ _theme_click_bridge = st.components.v2.component(
     export default function(component) {
       const { parentElement, setTriggerValue } = component;
       const doc = parentElement.ownerDocument;
-      const links = doc.querySelectorAll("a.theme-bubble-link[data-theme-key]");
-      links.forEach((link) => {
-        if (link.dataset.boundThemeClick === "1") return;
-        link.dataset.boundThemeClick = "1";
-        link.addEventListener("click", (e) => {
-          e.preventDefault();
-          const key = link.getAttribute("data-theme-key") || "";
-          setTriggerValue("theme_click", key);
-        });
-      });
+      if (doc.__themeDelegationBound) return;
+      doc.__themeDelegationBound = true;
+      doc.addEventListener("click", (e) => {
+        const target = e.target.closest(".theme-bubble-link[data-theme-key]");
+        if (!target) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const key = target.getAttribute("data-theme-key") || "";
+        if (key) setTriggerValue("theme_click", key);
+      }, true);
     }
     """,
 )
@@ -156,6 +159,26 @@ _hero_click_bridge = st.components.v2.component(
         e.preventDefault();
         setTriggerValue("go_home", true);
       });
+    }
+    """,
+)
+
+_copy_shortcut_bridge = st.components.v2.component(
+    "copy_shortcut_bridge",
+    html="<div id='copy-shortcut-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement } = component;
+      const doc = parentElement.ownerDocument;
+      if (doc.__copyShortcutBound) return;
+      doc.__copyShortcutBound = true;
+      doc.addEventListener("keydown", (e) => {
+        const isCopy = (e.ctrlKey || e.metaKey) && String(e.key || "").toLowerCase() === "c";
+        if (!isCopy) return;
+        // Keep native copy, but block Streamlit/global shortcut handlers.
+        e.stopPropagation();
+        if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+      }, true);
     }
     """,
 )
@@ -265,65 +288,238 @@ def normalize_broken_parentheses(text: str) -> str:
     return cleaned
 
 
-def build_company_three_line_summary(name, industry, products, desc, news_items):
-    industry_text = industry if industry and industry != "N/A" else "업종 정보 확인 필요"
+def _split_core_items(text: str, limit: int = 4) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+    normalized = raw.replace("/", ",").replace("·", ",").replace(";", ",").replace("|", ",")
+    parts = [normalize_broken_parentheses(x).strip() for x in normalized.split(",")]
+    out = []
+    skip = {"", "-", "N/A", "nan", "none", "확인 필요"}
+    for p in parts:
+        if p.lower() in skip or p in skip:
+            continue
+        if p not in out:
+            out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _clean_description_sentences(name: str, desc: str, limit: int = 3) -> list[str]:
+    if not desc or desc == "정보 없음":
+        return []
+    sentences = []
+    parts = re.split(r"(?<=[.!?])\s+|(?<=함\.)\s*|(?<=있음\.)\s*|(?<=다\.)\s*", str(desc).strip())
+    bad_exact = {"분야 기업입니다.", ")분야 기업입니다.", ") 분야 기업입니다."}
+    for part in parts:
+        s = normalize_broken_parentheses(part.replace("동사는", f"{name}는").strip())
+        if not s or len(s) < 14:
+            continue
+        if s.startswith(")") or s.startswith("("):
+            continue
+        if s in bad_exact:
+            continue
+        if "nan" in s.lower():
+            continue
+        if s not in sentences:
+            sentences.append(s)
+        if len(sentences) >= limit:
+            break
+    return sentences
+
+
+def build_company_profile_block(name, industry, products, desc):
+    industry_text = normalize_broken_parentheses(industry if industry and industry != "N/A" else "업종 정보 확인 필요")
     core_business = infer_core_business_labels(industry, products, desc)
     if not core_business or core_business in {"-", "N/A", "확인 필요"}:
         core_business = clean_products_text(products, industry, desc)
+    core_business = normalize_broken_parentheses(core_business)
 
-    overview_sentences = []
-    if desc and desc != "정보 없음":
-        parts = re.split(r"(?<=[.!?])\s+|(?<=함\.)\s*|(?<=있음\.)\s*", str(desc).strip())
-        for part in parts:
-            cleaned = part.strip()
-            if not cleaned:
-                continue
-            cleaned = cleaned.replace("동사는", name + "는")
-            cleaned = cleaned.replace("  ", " ").strip()
-            cleaned = normalize_broken_parentheses(cleaned)
-            # Drop broken tail fragments such as ") 분야 기업입니다."
-            if len(cleaned) < 12:
-                continue
-            if cleaned.startswith(")") or cleaned.startswith("("):
-                continue
-            if cleaned in {"분야 기업입니다.", ")분야 기업입니다.", ") 분야 기업입니다."}:
-                continue
-            if cleaned not in overview_sentences:
-                overview_sentences.append(cleaned)
+    product_items = _split_core_items(products, limit=4)
+    desc_lines = _clean_description_sentences(name, desc, limit=3)
+    core_items = _split_core_items(core_business, limit=3)
 
-    lines = []
-    if overview_sentences:
-        lines.append(overview_sentences[0])
+    head = desc_lines[0] if desc_lines else f"{name}은(는) {industry_text} 분야에서 사업하는 회사입니다."
+    if len(head) > 150:
+        head = head[:150].rstrip() + "..."
+
+    if product_items:
+        product_line = "· ".join(product_items[:3])
+    elif core_items:
+        product_line = "· ".join(core_items[:3])
     else:
-        lines.append(f"{name}은(는) {industry_text} 중심의 회사입니다.")
+        product_line = "주요 제품/사업 정보 확인 필요"
 
-    if len(overview_sentences) >= 2:
-        lines.append(overview_sentences[1])
+    second = desc_lines[1] if len(desc_lines) >= 2 else f"핵심 사업은 {core_business}이고, 이 사업의 수요가 실적에 큰 영향을 줍니다."
+    third = desc_lines[2] if len(desc_lines) >= 3 else f"볼 포인트는 {industry_text} 업황, 고객사 투자, 원가와 환율 변화입니다."
+
+    lines = [
+        f"요약: {head}",
+        f"핵심사업: {core_business}",
+        f"주요 제품/서비스: {product_line}",
+        f"사업구조: {second}",
+        f"체크포인트: {third}",
+    ]
+    return lines[:3]
+
+
+def build_company_detailed_report(name, industry, products, desc, news_items, related, snapshot):
+    industry_text = normalize_broken_parentheses(industry if industry and industry != "N/A" else "업종 정보 확인 필요")
+    core_business = normalize_broken_parentheses(infer_core_business_labels(industry, products, desc))
+    product_items = _split_core_items(products, limit=6)
+    desc_lines = _clean_description_sentences(name, desc, limit=5)
+
+    report = []
+    report.append(f"한줄 요약: {name}은(는) {industry_text} 회사입니다.")
+    if desc_lines:
+        report.append(f"무슨 회사인가: {desc_lines[0]}")
+    if len(desc_lines) >= 2:
+        report.append(f"주요 사업 구조: {desc_lines[1]}")
     else:
-        lines.append(f"핵심 사업은 {core_business}이며, 이 부문의 경쟁력과 수요가 실적에 큰 영향을 줍니다.")
+        report.append(f"주요 사업 구조: 핵심 사업은 {core_business}이고, 이 사업 수요가 매출과 이익에 영향을 줍니다.")
 
-    if len(overview_sentences) >= 3:
-        lines.append(overview_sentences[2])
+    if product_items:
+        report.append(f"주요 제품/서비스: {' · '.join(product_items[:5])}")
     else:
-        lines.append(f"주력 사업 구조를 보면 {industry_text} 업황 변화와 고객사 투자 사이클을 함께 보는 것이 좋습니다.")
+        report.append(f"주요 제품/서비스: {core_business if core_business else '추가 확인 필요'}")
 
-    if core_business not in {"-", "N/A", "확인 필요"}:
-        lines.append(f"특히 {core_business} 관련 수요, 수익성, 투자 확대 여부가 주가 흐름에 중요한 변수로 작용할 수 있습니다.")
+    ch = snapshot.get("change_pct")
+    if ch is not None:
+        report.append(f"오늘 주가 흐름: 등락률 {ch:+.2f}% 입니다.")
+
+    if related:
+        top_theme = normalize_broken_parentheses(str(related[0].get("matched_themes") or "연관 테마 확인 필요"))
+        reason = normalize_broken_parentheses(str(related[0].get("theme_reason") or related[0].get("matched_keywords") or "사업 키워드 중첩"))
+        report.append(f"시장에서는 이렇게 봄: {top_theme} 관련주로 보는 경우가 많습니다. (근거: {reason})")
 
     if news_items:
-        title = str(news_items[0].get("title", "")).strip()
-        if title:
-            title = title.replace("-v.daum.net", "").replace("- daum", "").strip()
-            if len(title) > 58:
-                title = title[:58].rstrip() + "..."
-            lines.append(f"최근에는 '{title}' 같은 이슈와 함께 시장에서 언급되고 있습니다.")
+        titles = []
+        for n in news_items[:3]:
+            t = normalize_broken_parentheses(str(n.get("title", "")).replace("-v.daum.net", "").replace("- daum", "").strip())
+            if t:
+                titles.append(t if len(t) <= 72 else t[:72].rstrip() + "...")
+        if titles:
+            report.append(f"최근 이슈: {' / '.join(titles)}")
 
-    cleaned_lines = []
-    for line in lines:
-        line = normalize_broken_parentheses(line)
-        if line and line not in cleaned_lines:
-            cleaned_lines.append(line)
-    return cleaned_lines[:5]
+    report.append("체크포인트: 실적 발표 일정, 고객사 투자, 원가/환율, 동종사 주가 흐름을 같이 보세요.")
+    return report[:8]
+
+
+def merge_company_info_lines(summary_lines, detailed_lines, max_lines: int = 7):
+    def _norm(s: str) -> str:
+        t = str(s or "").strip().lower()
+        t = re.sub(r"^(요약|한줄 요약|무슨 회사인가|핵심사업|주요 제품/서비스|주요 사업 구조|사업구조|체크포인트|최근 이슈|시장에서는 이렇게 봄)\s*:\s*", "", t)
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    merged = []
+    seen = []
+    for line in (summary_lines or []) + (detailed_lines or []):
+        raw = str(line or "").strip()
+        if not raw:
+            continue
+        n = _norm(raw)
+        if len(n) < 8:
+            continue
+        duplicated = False
+        for existing in seen:
+            if n == existing or n in existing or existing in n:
+                duplicated = True
+                break
+        if duplicated:
+            continue
+        seen.append(n)
+        merged.append(raw)
+        if len(merged) >= max_lines:
+            break
+    return merged
+
+
+def generate_ai_detailed_report(match, snapshot, related, news_items, peers, financial_table):
+    api_key = ""
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        api_key = ""
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return {"ok": False, "message": "OPENAI_API_KEY가 설정되지 않았습니다. (환경변수 또는 Streamlit Secrets)"}
+    api_key = str(api_key).strip()
+    try:
+        api_key.encode("ascii")
+    except Exception:
+        return {"ok": False, "message": "OPENAI_API_KEY 값에 한글/특수문자가 포함되어 있습니다. 실제 OpenAI 키(sk-...)로 교체해 주세요."}
+    if not api_key.startswith("sk-"):
+        return {"ok": False, "message": "OPENAI_API_KEY 형식이 올바르지 않습니다. `sk-`로 시작하는 실제 키를 입력해 주세요."}
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return {"ok": False, "message": "openai 패키지가 설치되지 않았습니다. requirements.txt에 openai를 추가해 주세요."}
+
+    company_name = str(match.get("name", ""))
+    symbol = str(match.get("symbol", ""))
+    exchange = str(match.get("exchange", ""))
+    currency = str(snapshot.get("currency", ""))
+    latest_close = fmt_num(snapshot.get("latest_close"), ",.2f")
+    change_pct = snapshot.get("change_pct")
+    change_text = "N/A" if change_pct is None else f"{change_pct:+.2f}%"
+    industry = str(snapshot.get("industry") or match.get("industry") or "N/A")
+    products = str(snapshot.get("products") or match.get("products") or "N/A")
+    description = str(snapshot.get("company_description") or "").strip()
+
+    prompt = f"""
+너는 한국 주식 리서치 어시스턴트다.
+아래 데이터만 근거로 쉬운 한국어 분석을 작성해라.
+모르는 내용은 추정하지 말고 '데이터 확인 필요'라고 써라.
+
+[회사]
+- 회사명: {company_name}
+- 종목코드: {symbol}
+- 시장: {exchange}
+- 통화: {currency}
+- 최근종가: {latest_close}
+- 당일등락률: {change_text}
+- 업종: {industry}
+- 주요제품/사업: {products}
+- 회사설명: {description}
+
+[같은 테마 종목 상위]
+{related[:6] if related else []}
+
+[최근 뉴스]
+{news_items[:6] if news_items else []}
+
+[동종업계 비교 상위]
+{peers[:6] if peers else []}
+
+[재무표 일부]
+{financial_table[:8] if financial_table else []}
+
+출력 형식:
+1) 회사 한줄 정의
+2) 핵심 사업 구조 (3~5개 불릿)
+3) 시장에서 보는 관점 (3개 불릿)
+4) 투자포인트 (긍정 3개 / 리스크 3개)
+5) 체크리스트 (숫자/공시 4개)
+6) 요약 결론 (2문장)
+"""
+
+    try:
+        client = OpenAI(api_key=api_key)
+        resp = client.responses.create(
+            model="gpt-5.5",
+            input=prompt,
+            max_output_tokens=1200,
+        )
+        text = (getattr(resp, "output_text", "") or "").strip()
+        if not text:
+            text = "분석 결과를 생성하지 못했습니다."
+        return {"ok": True, "text": text}
+    except Exception as exc:
+        return {"ok": False, "message": f"AI 상세분석 호출 실패: {exc}"}
 
 
 def fmt_num(value, pattern: str = ",.2f") -> str:
@@ -337,29 +533,45 @@ def fmt_num(value, pattern: str = ",.2f") -> str:
 
 def build_investment_points(match, snapshot, fundamentals, related):
     points = []
+    flow = fundamentals.get("flow") if isinstance(fundamentals, dict) else None
     ch = snapshot.get("change_pct")
     if ch is None:
-        points.append("단기 주가 방향성: 변동률 데이터가 부족해 추세 판단이 제한됩니다.")
+        points.append("모멘텀: 당일 변동률 데이터가 부족해 단기 탄력 판단이 제한됩니다.")
     elif ch >= 2:
-        points.append(f"단기 모멘텀: 최근 등락률이 {ch:+.2f}%로 강한 편입니다.")
+        points.append(f"모멘텀: 당일 등락률이 {ch:+.2f}%로 강한 구간입니다.")
     elif ch <= -2:
-        points.append(f"단기 모멘텀: 최근 등락률이 {ch:+.2f}%로 약한 편입니다.")
+        points.append(f"모멘텀: 당일 등락률이 {ch:+.2f}%로 약세 구간입니다.")
     else:
-        points.append(f"단기 모멘텀: 최근 등락률이 {ch:+.2f}%로 중립 구간입니다.")
+        points.append(f"모멘텀: 당일 등락률이 {ch:+.2f}%로 중립권입니다.")
 
     per = fundamentals.get("PER")
     pbr = fundamentals.get("PBR")
+    eps = fundamentals.get("EPS")
     if per is None and pbr is None:
-        points.append("밸류에이션: PER/PBR 데이터가 제한되어 절대평가가 어렵습니다.")
+        points.append("밸류에이션: PER/PBR 데이터가 제한적이라 절대평가 신뢰도가 낮습니다.")
     else:
-        points.append(f"밸류에이션: PER {fmt_num(per, ',.2f')} / PBR {fmt_num(pbr, ',.2f')} 수준입니다.")
+        eps_text = fmt_num(eps, ",.0f")
+        points.append(f"밸류에이션: PER {fmt_num(per, ',.2f')} / PBR {fmt_num(pbr, ',.2f')} / EPS {eps_text} 기준입니다.")
+
+    if isinstance(flow, dict):
+        inst_5d = flow.get("institution_5d")
+        foreign_5d = flow.get("foreign_5d")
+        if inst_5d is not None or foreign_5d is not None:
+            points.append(
+                f"수급: 최근 5거래일 기관 {fmt_num(inst_5d, ',.0f')}주 / 외국인 {fmt_num(foreign_5d, ',.0f')}주 순매수 흐름입니다."
+            )
 
     if related:
         top_theme = related[0].get("matched_themes") or "테마 데이터 부족"
-        points.append(f"시장 연관 테마: 현재 종목은 `{top_theme}` 축에서 함께 움직일 가능성이 큽니다.")
+        reason = related[0].get("theme_reason") or related[0].get("matched_keywords") or "관련 사업 키워드 중첩"
+        reason = normalize_broken_parentheses(str(reason))
+        if len(reason) > 58:
+            reason = reason[:58].rstrip() + "..."
+        points.append(f"테마 연동: `{top_theme}` 축 연관도가 높고, 근거는 {reason} 입니다.")
     else:
-        points.append("시장 연관 테마: 동행 종목 데이터가 부족해 추가 확인이 필요합니다.")
-    return points[:3]
+        points.append("테마 연동: 동행 종목 데이터가 부족해 테마 해석은 보수적으로 볼 필요가 있습니다.")
+    points.append("리스크 체크: 실적 발표 일정, 가이던스 변화, 대외 변수(금리/환율/원자재)를 함께 확인하는 것이 좋습니다.")
+    return points[:5]
 
 
 def _to_float_or_none(value):
@@ -515,13 +727,13 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
         bubbles.append(
             f"""
             <div class="theme-bubble-item">
-              <a class="theme-bubble-link" href="?t={theme_pick_key}" data-theme-key="{theme_pick_key}">
+              <div class="theme-bubble-link" data-theme-key="{theme_pick_key}">
                 <div class="theme-bubble" style="width:{size}px; height:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
                   <div class="theme-bubble-name">{theme_name}</div>
                   <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
                   <div class="theme-bubble-meta">{member_count}종목</div>
                 </div>
-              </a>
+              </div>
               {popup_html}
             </div>
             """
@@ -545,7 +757,7 @@ def render_theme_member_popup_html(row: dict, side: str = "UP") -> str:
         pct_text = f"+{pct:.2f}%" if pct > 0 else f"{pct:.2f}%"
         pct_cls = "pct-up" if pct > 0 else "pct-down"
         lines.append(
-            f"<a class='mover-row-link' href='?q={symbol}' data-symbol='{unquote_plus(symbol)}' style='margin-bottom:4px;'><span class='rank-pill'>{idx}</span><span class='mover-name-text'>{name}</span><span class='{pct_cls}'>{pct_text}</span></a>"
+            f"<div class='mover-row-link' data-symbol='{unquote_plus(symbol)}' style='margin-bottom:4px;'><span class='rank-pill'>{idx}</span><span class='mover-name-text'>{name}</span><span class='{pct_cls}'>{pct_text}</span></div>"
         )
     lines.append("<div style='margin-top:6px; font-size:0.78rem; color:#64748b;'>다른 원을 클릭하면 내용이 바뀝니다.</div></div>")
     return "".join(lines)
@@ -786,6 +998,7 @@ st.markdown(
       color: var(--ink) !important;
       text-decoration: none !important;
       font-weight: inherit;
+      cursor: pointer !important;
     }
     .rel-row { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; min-width:0; }
     .rel-main { min-width:0; flex:1; display:flex; align-items:center; gap:8px; overflow:hidden; }
@@ -933,6 +1146,7 @@ st.markdown(
     .theme-bubble-link {
       text-decoration:none !important;
       display:inline-flex;
+      cursor: pointer;
     }
     .theme-bubble-item {
       position: relative;
@@ -1263,6 +1477,7 @@ st.markdown(
       text-decoration:none !important;
       min-height:24px;
       transform: none;
+      cursor: pointer;
     }
     .mover-row-link:hover .mover-name-text {
       text-decoration: underline;
@@ -1449,6 +1664,7 @@ with head_right:
     )
 
 hero_result = _hero_click_bridge(on_go_home_change=lambda: None, isolate_styles=False, key="hero-click-bridge")
+_copy_shortcut_bridge(isolate_styles=False, key="copy-shortcut-bridge")
 if getattr(hero_result, "go_home", None):
     st.session_state["query_input"] = ""
     st.session_state["auto_search"] = False
@@ -1549,11 +1765,11 @@ if not effective_run and not st.session_state.get("last_match"):
                                 cols[i].markdown(
                                     f"""
                                     <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fffefe; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
-                                      <a class='mover-row-link' href='?q={query_value}' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
+                                      <div class='mover-row-link' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
                                         <span class='rank-pill'>{rank}</span>
                                         <span class='mover-name-text'>{item['name']}</span>
                                         <span class='pct-up'>+{float(item['change_pct']):.2f}%</span>
-                                      </a>
+                                      </div>
                                     </div>
                                     """,
                                     unsafe_allow_html=True,
@@ -1578,11 +1794,11 @@ if not effective_run and not st.session_state.get("last_match"):
                                 cols[i].markdown(
                                     f"""
                                     <div style="width:96%; margin:0 auto 4px auto; border:1px solid #eceff4; background:#fcfdff; border-radius:0; padding:4px 8px; min-height:34px; display:flex; align-items:center;">
-                                      <a class='mover-row-link' href='?q={query_value}' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
+                                      <div class='mover-row-link' data-symbol='{str(item.get("symbol") or item["name"])}' style="width:100%;">
                                         <span class='rank-pill'>{rank}</span>
                                         <span class='mover-name-text'>{item['name']}</span>
                                         <span class='pct-down'>{float(item['change_pct']):.2f}%</span>
-                                      </a>
+                                      </div>
                                     </div>
                                     """,
                                     unsafe_allow_html=True,
@@ -1677,14 +1893,23 @@ if effective_run or st.session_state.get("last_match"):
 
                 with st.container(border=True):
                     st.markdown("### 회사 기본정보")
-                    summary_lines = build_company_three_line_summary(
+                    summary_lines = build_company_profile_block(
+                        match["name"],
+                        industry,
+                        products,
+                        description if description != "정보 없음" else "",
+                    )
+                    detailed_lines = build_company_detailed_report(
                         match["name"],
                         industry,
                         products,
                         description if description != "정보 없음" else "",
                         news_items,
+                        related,
+                        snapshot,
                     )
-                    for line in summary_lines:
+                    merged_lines = merge_company_info_lines(summary_lines, detailed_lines, max_lines=7)
+                    for line in merged_lines:
                         st.write(f"- {line}")
 
                 is_krx_like = (match.get("market_type") or "").upper() != "GLOBAL"
@@ -1698,9 +1923,11 @@ if effective_run or st.session_state.get("last_match"):
                     if table_f:
                         f = table_f
                         f_basis = table_basis
+                    if isinstance(flow, dict) and flow:
+                        f["flow"] = flow
 
                     with st.container(border=True):
-                        st.markdown("### 투자 포인트 3줄")
+                        st.markdown("### 투자 포인트")
                         for p in build_investment_points(match, snapshot, f, related[:3]):
                             st.write(f"- {p}")
 
