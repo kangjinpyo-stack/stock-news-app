@@ -474,11 +474,11 @@ def build_theme_bubble_style(avg_change: float, member_count: int, relative_stre
     if avg_change >= 0:
         color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
         bg = f"radial-gradient(circle at 30% 30%, rgba(255,250,250,0.98), rgba(254,202,202,{0.16 + 0.30 * color_intensity:.2f}) 42%, rgba(248,113,113,{0.24 + 0.42 * color_intensity:.2f}) 66%, rgba(220,38,38,{0.28 + 0.62 * color_intensity:.2f}) 100%)"
-        text = "#7f1d1d" if intensity < 0.72 else "#fff7ed"
+        text = "#7f1d1d"
     else:
         color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
         bg = f"radial-gradient(circle at 30% 30%, rgba(248,251,255,0.98), rgba(191,219,254,{0.16 + 0.28 * color_intensity:.2f}) 42%, rgba(96,165,250,{0.24 + 0.40 * color_intensity:.2f}) 66%, rgba(29,78,216,{0.30 + 0.60 * color_intensity:.2f}) 100%)"
-        text = "#1e3a8a" if intensity < 0.72 else "#eff6ff"
+        text = "#1e3a8a"
     return size, bg, text
 
 
