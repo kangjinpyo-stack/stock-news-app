@@ -190,6 +190,193 @@ _copy_shortcut_bridge = st.components.v2.component(
     """,
 )
 
+_theme_drag_bridge = st.components.v2.component(
+    "theme_drag_bridge",
+    html="<div id='theme-drag-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement } = component;
+      const doc = parentElement.ownerDocument;
+      if (doc.__themeDragBound) return;
+      doc.__themeDragBound = true;
+
+      let dragState = null;
+      const GAP = 6;
+
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+      const applyXY = (el, x, y) => {
+        el.style.transform = `translate(${x}px, ${y}px)`;
+        el.dataset.tx = String(x);
+        el.dataset.ty = String(y);
+      };
+
+      const getRectInLane = (el, laneRect) => {
+        const r = el.getBoundingClientRect();
+        return {
+          left: r.left - laneRect.left,
+          right: r.right - laneRect.left,
+          top: r.top - laneRect.top,
+          bottom: r.bottom - laneRect.top,
+          w: r.width,
+          h: r.height,
+          cx: (r.left + r.right) / 2 - laneRect.left,
+          cy: (r.top + r.bottom) / 2 - laneRect.top,
+        };
+      };
+
+      const separatePair = (a, b, state, laneRect) => {
+        const ar = getRectInLane(a, laneRect);
+        const br = getRectInLane(b, laneRect);
+        const ra = Math.min(ar.w, ar.h) / 2;
+        const rb = Math.min(br.w, br.h) / 2;
+        const dx = br.cx - ar.cx;
+        const dy = br.cy - ar.cy;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        const overlap = (ra + rb + GAP) - dist;
+        if (overlap <= 0) return { moved: false, blocked: false };
+        const moveB = (b !== state.item); // dragging item은 최대한 고정, 다른 원을 우선 이동
+        const target = moveB ? b : a;
+        const ux = dx / dist;
+        const uy = dy / dist;
+        let tx = Number(target.dataset.tx || "0");
+        let ty = Number(target.dataset.ty || "0");
+        const push = overlap + 0.6;
+        if (moveB) {
+          tx += ux * push;
+          ty += uy * push;
+        } else {
+          tx -= ux * push;
+          ty -= uy * push;
+        }
+        const prevX = Number(target.dataset.tx || "0");
+        const prevY = Number(target.dataset.ty || "0");
+        tx = clamp(tx, state.minXMap.get(target), state.maxXMap.get(target));
+        ty = clamp(ty, state.minYMap.get(target), state.maxYMap.get(target));
+        // 경계에 막혀 실제 좌표 변화가 없으면 더 밀지 않는다.
+        if (Math.abs(tx - prevX) < 0.01 && Math.abs(ty - prevY) < 0.01) {
+          return { moved: false, blocked: true };
+        }
+        applyXY(target, tx, ty);
+        return { moved: true, blocked: false };
+      };
+
+      const resolveCollisions = (state) => {
+        const laneRect = state.lane.getBoundingClientRect();
+        const nodes = state.nodes;
+        // chain collision 정리: 여러 번 반복해서 남은 겹침까지 제거
+        let blocked = false;
+        for (let iter = 0; iter < 16; iter++) {
+          let moved = false;
+          for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+              const res = separatePair(nodes[i], nodes[j], state, laneRect);
+              if (res.moved) moved = true;
+              if (res.blocked) blocked = true;
+            }
+          }
+          if (!moved) break;
+        }
+        return blocked;
+      };
+
+      const hasOverlapWithOthers = (state) => {
+        const laneRect = state.lane.getBoundingClientRect();
+        const active = getRectInLane(state.item, laneRect);
+        const ra = Math.min(active.w, active.h) / 2;
+        for (const n of state.nodes) {
+          if (n === state.item) continue;
+          const r = getRectInLane(n, laneRect);
+          const rb = Math.min(r.w, r.h) / 2;
+          const dist = Math.hypot(active.cx - r.cx, active.cy - r.cy);
+          if (dist < (ra + rb + GAP)) return true;
+        }
+        return false;
+      };
+
+      const onMove = (e) => {
+        if (!dragState) return;
+        if (e.cancelable) e.preventDefault();
+        const p = e.touches ? e.touches[0] : e;
+        const dx = p.clientX - dragState.startX;
+        const dy = p.clientY - dragState.startY;
+        let nx = dragState.baseX + dx;
+        let ny = dragState.baseY + dy;
+        nx = Math.max(dragState.minX, Math.min(dragState.maxX, nx));
+        ny = Math.max(dragState.minY, Math.min(dragState.maxY, ny));
+        const snapshot = new Map();
+        for (const n of dragState.nodes) {
+          snapshot.set(n, {
+            x: Number(n.dataset.tx || "0"),
+            y: Number(n.dataset.ty || "0"),
+          });
+        }
+        applyXY(dragState.item, nx, ny);
+        resolveCollisions(dragState);
+        // 밀 수 없어서 겹침이 남으면 이번 프레임 이동은 취소
+        if (hasOverlapWithOthers(dragState)) {
+          for (const [node, pos] of snapshot.entries()) {
+            applyXY(node, pos.x, pos.y);
+          }
+        }
+      };
+
+      const endDrag = () => {
+        if (!dragState) return;
+        dragState.item.classList.remove("dragging");
+        dragState = null;
+      };
+
+      doc.addEventListener("mousemove", onMove, true);
+      doc.addEventListener("touchmove", onMove, { capture: true, passive: false });
+      doc.addEventListener("mouseup", endDrag, true);
+      doc.addEventListener("touchend", endDrag, true);
+
+      doc.addEventListener("mousedown", (e) => {
+        const item = e.target.closest(".theme-bubble-item");
+        if (!item) return;
+        if (e.target.closest(".theme-member-popup")) return;
+        const lane = item.closest(".theme-bubble-lane");
+        if (!lane) return;
+        const itemRect = item.getBoundingClientRect();
+        const laneRect = lane.getBoundingClientRect();
+        const baseX = Number(item.dataset.tx || "0");
+        const baseY = Number(item.dataset.ty || "0");
+        const minXMap = new Map();
+        const maxXMap = new Map();
+        const minYMap = new Map();
+        const maxYMap = new Map();
+        const nodes = Array.from(lane.querySelectorAll(".theme-bubble-item"));
+        for (const b of nodes) {
+          const r = b.getBoundingClientRect();
+          minXMap.set(b, -Math.max(0, r.left - laneRect.left));
+          maxXMap.set(b, Math.max(0, laneRect.right - r.right));
+          minYMap.set(b, -Math.max(0, r.top - laneRect.top));
+          maxYMap.set(b, Math.max(0, laneRect.bottom - r.bottom));
+        }
+        dragState = {
+          item,
+          lane,
+          startX: e.clientX,
+          startY: e.clientY,
+          baseX,
+          baseY,
+          minX: -Math.max(0, itemRect.left - laneRect.left),
+          maxX: Math.max(0, laneRect.right - itemRect.right),
+          minY: -Math.max(0, itemRect.top - laneRect.top),
+          maxY: Math.max(0, laneRect.bottom - itemRect.bottom),
+          minXMap,
+          maxXMap,
+          minYMap,
+          maxYMap,
+          nodes,
+        };
+        item.classList.add("dragging");
+      }, true);
+    }
+    """,
+)
+
 
 def first_sentence(text: str, limit: int = 170) -> str:
     if not text:
@@ -711,7 +898,7 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
         rows,
         key=lambda x: (abs(float(x.get('avg_change', 0))), int(x.get('member_count', 0))),
         reverse=True,
-    )[:12]
+    )[:10]
     max_abs_change = max([abs(float(x.get("avg_change", 0))) for x in sorted_rows], default=1.0)
     max_abs_change = max(max_abs_change, 0.1)
     lane_key = "UP" if positive else "DOWN"
@@ -722,6 +909,8 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
         theme_pick_key = quote_plus(f"{lane_key}|{theme_name}")
         relative_strength = min(max(abs(avg_change) / max_abs_change, 0.0), 1.0)
         size, bg, text = build_theme_bubble_style(avg_change, member_count, relative_strength)
+        if not positive:
+            size = max(78, int(size * 0.82))
         sign = "+" if avg_change > 0 else ""
         strength = min(max(abs(avg_change), 0.0), 12.0) / 12.0
         ring = 1 + int(strength * 3)
@@ -731,11 +920,12 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
             popup_row = next((x for x in sorted_rows if str(x.get("theme", "")).strip() == popup_theme), None)
             if popup_row:
                 popup_html = render_theme_member_popup_html(popup_row, side=lane_key)
+        item_cls = "theme-bubble-item active-popup" if popup_html else "theme-bubble-item"
         bubbles.append(
             f"""
-            <div class="theme-bubble-item">
+            <div class="{item_cls}">
               <div class="theme-bubble-link" data-theme-key="{theme_pick_key}">
-                <div class="theme-bubble" style="width:{size}px; height:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
+                <div class="theme-bubble" style="--bubble-size:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
                   <div class="theme-bubble-name">{theme_name}</div>
                   <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
                   <div class="theme-bubble-meta">{member_count}종목</div>
@@ -851,7 +1041,7 @@ def load_financial_table_cached(symbol: str):
 
 THEME_MOVER_CACHE_VERSION = "theme-v12"
 MARKET_MOVER_UI_VERSION = "bubble-v19"
-MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top64-v3"
+MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top100-v1"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -861,7 +1051,7 @@ def load_today_theme_movers_cached(_version: str = THEME_MOVER_CACHE_VERSION):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_market_wide_movers_cached(_version: str = MARKET_WIDE_MOVER_CACHE_VERSION):
-    return get_market_wide_movers(limit_each_market=20, top_n=64)
+    return get_market_wide_movers(limit_each_market=120, top_n=100)
 
 st.markdown(
     """
@@ -882,7 +1072,7 @@ st.markdown(
     }
     .block-container,
     [data-testid="stAppViewContainer"] > .main .block-container {
-      max-width: 1180px;
+      max-width: 1420px;
       padding-top: 2.4rem;
       padding-bottom: 2rem;
     }
@@ -1105,6 +1295,7 @@ st.markdown(
       color: #0b1736;
     }
     .theme-bubble-board {
+      --bubble-scale: 1;
       background:
         radial-gradient(circle at 15% 15%, rgba(254,226,226,0.55), transparent 24%),
         radial-gradient(circle at 85% 18%, rgba(219,234,254,0.72), transparent 28%),
@@ -1114,6 +1305,7 @@ st.markdown(
       padding:18px 18px 20px 18px;
       box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
       position: relative;
+      overflow: visible;
     }
     .theme-bubble-grid {
       display:grid;
@@ -1128,6 +1320,7 @@ st.markdown(
       background: rgba(255,255,255,0.74);
       display:flex;
       flex-direction:column;
+      overflow: visible;
     }
     .theme-bubble-lane.up {
       background: linear-gradient(180deg, rgba(255,245,245,0.96) 0%, rgba(255,255,255,0.80) 100%);
@@ -1158,8 +1351,18 @@ st.markdown(
     .theme-bubble-item {
       position: relative;
       display: inline-flex;
+      cursor: grab;
+      user-select: none;
+      z-index: 1;
+    }
+    .theme-bubble-item.active-popup { z-index: 12000; }
+    .theme-bubble-item.dragging {
+      cursor: grabbing;
+      z-index: 13000;
     }
     .theme-bubble {
+      width: calc(var(--bubble-size, 120px) * var(--bubble-scale));
+      height: calc(var(--bubble-size, 120px) * var(--bubble-scale));
       border-radius: 999px;
       display:flex;
       flex-direction:column;
@@ -1179,7 +1382,7 @@ st.markdown(
       border-radius: 12px;
       padding: 10px 12px;
       box-shadow: 0 10px 24px rgba(15,23,42,0.18);
-      z-index: 40;
+      z-index: 9999;
     }
     .theme-member-popup.floating {
       position: absolute;
@@ -1639,6 +1842,7 @@ st.markdown(
       border-radius: 0 !important;
     }
     @media (max-width: 900px) {
+      .theme-bubble-board { --bubble-scale: 0.86; }
       .theme-bubble-grid { grid-template-columns: 1fr; }
       .theme-bubble-lane { min-height: 220px; }
       .theme-mover-grid { grid-template-columns: 1fr; }
@@ -1648,6 +1852,9 @@ st.markdown(
       .rel-main { width:100%; flex-wrap:wrap; }
       .rel-sub { white-space: normal; }
       .score-wrap { width: 100%; margin-left: 0; }
+    }
+    @media (max-width: 760px) {
+      .theme-bubble-board { --bubble-scale: 0.72; }
     }
     </style>
     """,
@@ -1742,6 +1949,7 @@ if not effective_run and not st.session_state.get("last_match"):
                 unsafe_allow_html=True,
             )
             theme_bridge_result = _theme_click_bridge(on_theme_click_change=lambda: None, isolate_styles=False, key="theme-bridge")
+            _theme_drag_bridge(isolate_styles=False, key="theme-drag-bridge")
             if getattr(theme_bridge_result, "theme_click", None):
                 clicked = unquote_plus(str(theme_bridge_result.theme_click))
                 st.session_state["theme_popup_key"] = "" if clicked == "__CLEAR__" else clicked
@@ -1763,7 +1971,7 @@ if not effective_run and not st.session_state.get("last_match"):
                     unsafe_allow_html=True,
                 )
                 if top_risers:
-                    with st.container(height=206, border=False, key="mover-list-up"):
+                    with st.container(border=False, key="mover-list-up"):
                         display_risers = top_risers[:100]
                         for row_idx, pair in enumerate(chunked_rows(display_risers, 2)):
                             cols = st.columns(2, vertical_alignment="center", gap="small")
@@ -1792,7 +2000,7 @@ if not effective_run and not st.session_state.get("last_match"):
                     unsafe_allow_html=True,
                 )
                 if top_fallers:
-                    with st.container(height=206, border=False, key="mover-list-down"):
+                    with st.container(border=False, key="mover-list-down"):
                         display_fallers = top_fallers[:100]
                         for row_idx, pair in enumerate(chunked_rows(display_fallers, 2)):
                             cols = st.columns(2, vertical_alignment="center", gap="small")
