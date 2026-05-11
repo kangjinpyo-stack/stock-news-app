@@ -1,6 +1,6 @@
 ﻿import datetime as dt
 from collections import OrderedDict
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote_plus
 from concurrent.futures import ThreadPoolExecutor
 
 import re
@@ -41,6 +41,8 @@ if "last_related" not in st.session_state:
     st.session_state["last_related"] = []
 if "last_extra" not in st.session_state:
     st.session_state["last_extra"] = {}
+if "theme_popup_key" not in st.session_state:
+    st.session_state["theme_popup_key"] = ""
 
 applied_pending_query = ""
 pending_query = st.session_state.get("pending_query")
@@ -65,6 +67,12 @@ if qp_query:
     st.session_state["auto_search"] = True
     st.query_params.clear()
 
+qp_theme = st.query_params.get("t")
+if qp_theme:
+    normalized_t = qp_theme[0] if isinstance(qp_theme, list) else str(qp_theme)
+    st.session_state["theme_popup_key"] = unquote_plus(normalized_t)
+    st.query_params.clear()
+
 st.set_page_config(page_title="KRX Stock Pulse", page_icon="📊", layout="wide")
 
 _mover_click_bridge = st.components.v2.component(
@@ -82,6 +90,27 @@ _mover_click_bridge = st.components.v2.component(
           e.preventDefault();
           const symbol = link.getAttribute("data-symbol") || "";
           setTriggerValue("symbol_click", symbol);
+        });
+      });
+    }
+    """,
+)
+
+_theme_click_bridge = st.components.v2.component(
+    "theme_click_bridge",
+    html="<div id='theme-click-bridge'></div>",
+    js="""
+    export default function(component) {
+      const { parentElement, setTriggerValue } = component;
+      const doc = parentElement.ownerDocument;
+      const links = doc.querySelectorAll("a.theme-bubble-link[data-theme-key]");
+      links.forEach((link) => {
+        if (link.dataset.boundThemeClick === "1") return;
+        link.dataset.boundThemeClick = "1";
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          const key = link.getAttribute("data-theme-key") || "";
+          setTriggerValue("theme_click", key);
         });
       });
     }
@@ -453,7 +482,7 @@ def build_theme_bubble_style(avg_change: float, member_count: int, relative_stre
     return size, bg, text
 
 
-def render_theme_bubble_cluster(rows, positive: bool = True) -> str:
+def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = "") -> str:
     if not rows:
         empty_label = "상승 테마를 아직 만들지 못했습니다." if positive else "하락 테마를 아직 만들지 못했습니다."
         return f"<div class='theme-bubble-empty'>{empty_label}</div>"
@@ -466,25 +495,60 @@ def render_theme_bubble_cluster(rows, positive: bool = True) -> str:
     )[:12]
     max_abs_change = max([abs(float(x.get("avg_change", 0))) for x in sorted_rows], default=1.0)
     max_abs_change = max(max_abs_change, 0.1)
+    lane_key = "UP" if positive else "DOWN"
     for row in sorted_rows:
         avg_change = float(row.get("avg_change", 0))
         member_count = int(row.get("member_count", 0))
+        theme_name = str(row.get("theme", "")).strip()
+        theme_pick_key = quote_plus(f"{lane_key}|{theme_name}")
         relative_strength = min(max(abs(avg_change) / max_abs_change, 0.0), 1.0)
         size, bg, text = build_theme_bubble_style(avg_change, member_count, relative_strength)
         sign = "+" if avg_change > 0 else ""
         strength = min(max(abs(avg_change), 0.0), 12.0) / 12.0
         ring = 1 + int(strength * 3)
         ring_color = "rgba(185,28,28,0.55)" if avg_change >= 0 else "rgba(30,64,175,0.55)"
+        popup_html = ""
+        if popup_theme and theme_name == popup_theme:
+            popup_row = next((x for x in sorted_rows if str(x.get("theme", "")).strip() == popup_theme), None)
+            if popup_row:
+                popup_html = render_theme_member_popup_html(popup_row, side=lane_key)
         bubbles.append(
             f"""
-            <div class="theme-bubble" style="width:{size}px; height:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
-              <div class="theme-bubble-name">{row.get('theme', '')}</div>
-              <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
-              <div class="theme-bubble-meta">{member_count}종목</div>
+            <div class="theme-bubble-item">
+              <a class="theme-bubble-link" href="?t={theme_pick_key}" data-theme-key="{theme_pick_key}">
+                <div class="theme-bubble" style="width:{size}px; height:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
+                  <div class="theme-bubble-name">{theme_name}</div>
+                  <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
+                  <div class="theme-bubble-meta">{member_count}종목</div>
+                </div>
+              </a>
+              {popup_html}
             </div>
             """
         )
     return "".join(bubbles)
+
+
+def render_theme_member_popup_html(row: dict, side: str = "UP") -> str:
+    theme_name = str(row.get("theme", "")).strip()
+    members = row.get("members", [])[:16]
+    if not theme_name or not members:
+        return ""
+    popup_class = "up" if side == "UP" else "down"
+    lines = [
+        f"<div class='theme-member-popup floating {popup_class}'><div class='theme-member-title'>{theme_name} 관련 종목</div>"
+    ]
+    for idx, member in enumerate(members, start=1):
+        symbol = quote_plus(str(member.get("symbol") or member.get("name") or ""))
+        name = str(member.get("name", "")).strip()
+        pct = float(member.get("change_pct", 0))
+        pct_text = f"+{pct:.2f}%" if pct > 0 else f"{pct:.2f}%"
+        pct_cls = "pct-up" if pct > 0 else "pct-down"
+        lines.append(
+            f"<a class='mover-row-link' href='?q={symbol}' data-symbol='{unquote_plus(symbol)}' style='margin-bottom:4px;'><span class='rank-pill'>{idx}</span><span class='mover-name-text'>{name}</span><span class='{pct_cls}'>{pct_text}</span></a>"
+        )
+    lines.append("<div style='margin-top:6px; font-size:0.78rem; color:#64748b;'>다른 원을 클릭하면 내용이 바뀝니다.</div></div>")
+    return "".join(lines)
 
 
 def collect_theme_leaderboard(theme_movers):
@@ -566,14 +630,14 @@ def load_financial_table_cached(symbol: str):
     return get_krx_financial_table(symbol)
 
 
-THEME_MOVER_CACHE_VERSION = "theme-v9"
+THEME_MOVER_CACHE_VERSION = "theme-v12"
 MARKET_MOVER_UI_VERSION = "bubble-v19"
 MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top64-v3"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_today_theme_movers_cached(_version: str = THEME_MOVER_CACHE_VERSION):
-    return get_today_theme_movers(limit_themes=12, members_per_theme=6)
+    return get_today_theme_movers(limit_themes=30, members_per_theme=12)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -829,6 +893,7 @@ st.markdown(
       border-radius:22px;
       padding:18px 18px 20px 18px;
       box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+      position: relative;
     }
     .theme-bubble-grid {
       display:grid;
@@ -865,6 +930,14 @@ st.markdown(
       gap: 12px;
       flex:1;
     }
+    .theme-bubble-link {
+      text-decoration:none !important;
+      display:inline-flex;
+    }
+    .theme-bubble-item {
+      position: relative;
+      display: inline-flex;
+    }
     .theme-bubble {
       border-radius: 999px;
       display:flex;
@@ -877,6 +950,36 @@ st.markdown(
         inset 0 1px 0 rgba(255,255,255,0.45),
         0 10px 24px rgba(15, 23, 42, 0.10);
       transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    .theme-member-popup {
+      margin-top: 10px;
+      border: 1px solid #dbe4f0;
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 24px rgba(15,23,42,0.18);
+      z-index: 40;
+    }
+    .theme-member-popup.floating {
+      position: absolute;
+      left: 74%;
+      top: 74%;
+      transform: translate(0, 0);
+      width: min(320px, 92vw);
+      margin: 0;
+    }
+    .theme-member-popup.floating.up {
+      left: 74%;
+    }
+    .theme-member-popup.floating.down {
+      left: 74%;
+      right: auto;
+    }
+    .theme-member-title {
+      font-size: 0.92rem;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 8px;
     }
     .theme-bubble:hover {
       transform: translateY(-2px);
@@ -1384,30 +1487,41 @@ if not effective_run and not st.session_state.get("last_match"):
             theme_movers.get("up", []) + theme_movers.get("down", []),
             key=lambda x: abs(float(x.get("avg_change", 0))),
             reverse=True,
-        )[:24]
+        )[:40]
         top_risers = market_wide_movers.get("rise", [])
         top_fallers = market_wide_movers.get("fall", [])
         up_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) >= 0]
         down_theme_rows = [row for row in all_theme_rows if float(row.get("avg_change", 0)) < 0]
 
         if all_theme_rows:
+            popup_key = str(st.session_state.get("theme_popup_key", "")).strip()
+            popup_side = ""
+            popup_theme = ""
+            if popup_key and "|" in popup_key:
+                popup_side, popup_theme = popup_key.split("|", 1)
+            popup_up = popup_theme if popup_side == "UP" else ""
+            popup_down = popup_theme if popup_side == "DOWN" else ""
             st.markdown(
                 f"""
                 <div class="theme-bubble-board">
                   <div class="theme-bubble-grid">
                     <div class="theme-bubble-lane up">
                       <div class="theme-bubble-lane-title">강한 상승 테마</div>
-                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(up_theme_rows, positive=True)}</div>
+                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(up_theme_rows, positive=True, popup_theme=popup_up)}</div>
                     </div>
                     <div class="theme-bubble-lane down">
                       <div class="theme-bubble-lane-title">약세/하락 테마</div>
-                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(down_theme_rows, positive=False)}</div>
+                      <div class="theme-bubble-wrap">{render_theme_bubble_cluster(down_theme_rows, positive=False, popup_theme=popup_down)}</div>
                     </div>
                   </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            theme_bridge_result = _theme_click_bridge(on_theme_click_change=lambda: None, isolate_styles=False, key="theme-bridge")
+            if getattr(theme_bridge_result, "theme_click", None):
+                st.session_state["theme_popup_key"] = unquote_plus(str(theme_bridge_result.theme_click))
+                st.rerun()
         else:
             st.caption("오늘 테마 맵을 아직 만들지 못했습니다.")
             stats = theme_movers.get("stats", {})

@@ -1492,13 +1492,14 @@ def get_recent_news(query: str, limit: int = 5) -> List[Dict[str, str]]:
         return []
 
 
-def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) -> Dict[str, Any]:
-    theme_map = build_augmented_theme_map(max_codes=36)
+def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) -> Dict[str, Any]:
+    theme_map = build_augmented_theme_map(max_codes=220)
     if not theme_map:
         return {"up": [], "down": [], "as_of": dt.datetime.now().strftime("%Y-%m-%d"), "error": "테마 맵이 비어 있습니다."}
 
     name_lookup = get_theme_map_name_lookup()
-    theme_groups: Dict[str, List[Dict[str, Any]]] = {}
+    theme_groups_up: Dict[str, List[Dict[str, Any]]] = {}
+    theme_groups_down: Dict[str, List[Dict[str, Any]]] = {}
     today_label = dt.datetime.now().strftime("%Y-%m-%d")
     success_count = 0
     fail_count = 0
@@ -1554,6 +1555,10 @@ def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) ->
             if theme_name and theme_name in normalized_mapped and theme_name not in theme_candidates:
                 theme_candidates.append(theme_name)
         if not theme_candidates:
+            # Fallback: when strict business alignment is too narrow,
+            # still keep mapped themes so today's theme board has enough coverage.
+            theme_candidates = normalized_mapped[:2]
+        if not theme_candidates:
             continue
 
         item = {
@@ -1565,32 +1570,40 @@ def get_today_theme_movers(limit_themes: int = 6, members_per_theme: int = 4) ->
             theme_key = to_text(theme).strip()
             if not theme_key:
                 continue
-            theme_groups.setdefault(theme_key, []).append(item)
+            if item["change_pct"] > 0:
+                theme_groups_up.setdefault(theme_key, []).append(item)
+            elif item["change_pct"] < 0:
+                theme_groups_down.setdefault(theme_key, []).append(item)
 
-    summary_rows: List[Dict[str, Any]] = []
+    def build_summary_rows(theme_groups: Dict[str, List[Dict[str, Any]]], is_up: bool) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for theme, members in theme_groups.items():
+            if not members:
+                continue
+            ordered_members = sorted(members, key=lambda x: x["change_pct"], reverse=True)
+            avg_change = sum(x["change_pct"] for x in ordered_members) / len(ordered_members)
+            rising_count = len([x for x in ordered_members if x["change_pct"] > 0])
+            rows.append(
+                {
+                    "theme": theme,
+                    "avg_change": round(avg_change, 2),
+                    "rising_count": rising_count,
+                    "member_count": len(ordered_members),
+                    "members": ordered_members[:members_per_theme],
+                    "all_members": ordered_members,
+                }
+            )
+        if is_up:
+            rows.sort(key=lambda x: (-x["avg_change"], -x["member_count"], x["theme"]))
+        else:
+            rows.sort(key=lambda x: (x["avg_change"], -x["member_count"], x["theme"]))
+        return rows
+
+    up_rows = build_summary_rows(theme_groups_up, is_up=True)
+    down_rows = build_summary_rows(theme_groups_down, is_up=False)
     all_items: List[Dict[str, Any]] = []
-    for theme, members in theme_groups.items():
-        if len(members) < 1:
-            continue
-        ordered_members = sorted(members, key=lambda x: x["change_pct"], reverse=True)
-        avg_change = sum(x["change_pct"] for x in ordered_members) / len(ordered_members)
-        rising_count = len([x for x in ordered_members if x["change_pct"] > 0])
-        all_items.extend(ordered_members)
-        summary_rows.append(
-            {
-                "theme": theme,
-                "avg_change": round(avg_change, 2),
-                "rising_count": rising_count,
-                "member_count": len(ordered_members),
-                "members": ordered_members[:members_per_theme],
-                "all_members": ordered_members,
-            }
-        )
-
-    up_rows = [x for x in summary_rows if x["avg_change"] > 0]
-    down_rows = [x for x in summary_rows if x["avg_change"] < 0]
-    up_rows.sort(key=lambda x: (-x["avg_change"], -x["rising_count"], x["theme"]))
-    down_rows.sort(key=lambda x: (x["avg_change"], x["rising_count"], x["theme"]))
+    for row in up_rows + down_rows:
+        all_items.extend(row.get("all_members", []))
 
     error_msg = ""
     if success_count == 0:
