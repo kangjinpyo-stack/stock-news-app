@@ -111,6 +111,10 @@ _theme_click_bridge = st.components.v2.component(
       doc.addEventListener("click", (e) => {
         const target = e.target.closest(".theme-bubble-link[data-theme-key]");
         if (target) {
+          // 클릭 순간에도 즉시 최상단 레이어로 올려 깜빡 가림 방지
+          doc.querySelectorAll(".theme-bubble-item.instant-active").forEach((el) => el.classList.remove("instant-active"));
+          const item = target.closest(".theme-bubble-item");
+          if (item) item.classList.add("instant-active");
           e.preventDefault();
           e.stopPropagation();
           const key = target.getAttribute("data-theme-key") || "";
@@ -164,7 +168,7 @@ _hero_click_bridge = st.components.v2.component(
       title.style.cursor = "pointer";
       title.addEventListener("click", (e) => {
         e.preventDefault();
-        setTriggerValue("go_home", true);
+        setTriggerValue("go_home_reload", true);
       });
     }
     """,
@@ -565,65 +569,108 @@ def build_company_detailed_report(name, industry, products, desc, news_items, re
     desc_lines = _clean_description_sentences(name, desc, limit=5)
 
     report = []
-    report.append(f"한줄 요약: {name}은(는) {industry_text} 회사입니다.")
     if desc_lines:
-        report.append(f"무슨 회사인가: {desc_lines[0]}")
-    if len(desc_lines) >= 2:
-        report.append(f"주요 사업 구조: {desc_lines[1]}")
+        report.append(f"회사 개요: {desc_lines[0]}")
     else:
-        report.append(f"주요 사업 구조: 핵심 사업은 {core_business}이고, 이 사업 수요가 매출과 이익에 영향을 줍니다.")
+        report.append(f"회사 개요: {name}은(는) {industry_text} 분야에서 사업하는 회사입니다.")
+    if len(desc_lines) >= 2:
+        report.append(f"사업 상세: {desc_lines[1]}")
+    else:
+        report.append(f"사업 상세: {core_business} 중심이며, 해당 분야 수요와 고객사 투자 집행이 실적에 영향을 줍니다.")
+    if len(desc_lines) >= 3:
+        report.append(f"사업 구조: {desc_lines[2]}")
+    else:
+        p_items = _split_core_items(products, limit=5)
+        if p_items:
+            left = " · ".join(p_items[:3])
+            right = " · ".join(p_items[3:5]) if len(p_items) > 3 else ""
+            if right:
+                report.append(
+                    f"사업 구조: 매출은 `{left}` 축에서 발생하고, `{right}` 영역으로 확장되는 구조입니다. "
+                    f"업황/고객사 투자에 따라 품목별 비중과 수익성이 달라질 수 있습니다."
+                )
+            else:
+                report.append(
+                    f"사업 구조: 매출은 `{left}` 중심이며, 고객사 투자 사이클과 업황 변화에 따라 실적 변동성이 커질 수 있습니다."
+                )
+        else:
+            report.append(
+                f"사업 구조: {core_business} 중심의 단일/집중 구조로 보이며, 수요 강도와 원가(원재료·환율)가 수익성에 직접 영향을 줍니다."
+            )
 
     if product_items:
         report.append(f"주요 제품/서비스: {' · '.join(product_items[:5])}")
     else:
         report.append(f"주요 제품/서비스: {core_business if core_business else '추가 확인 필요'}")
 
-    ch = snapshot.get("change_pct")
-    if ch is not None:
-        report.append(f"오늘 주가 흐름: 등락률 {ch:+.2f}% 입니다.")
-
+    # 읽기 쉬운 투자 관점 문장(설명형)
     if related:
         top_theme = normalize_broken_parentheses(str(related[0].get("matched_themes") or "연관 테마 확인 필요"))
         reason = normalize_broken_parentheses(str(related[0].get("theme_reason") or related[0].get("matched_keywords") or "사업 키워드 중첩"))
-        report.append(f"시장에서는 이렇게 봄: {top_theme} 관련주로 보는 경우가 많습니다. (근거: {reason})")
+        report.append(f"시장 포지션: 현재 시장에서는 `{top_theme}` 축으로 함께 움직이는 종목으로 보는 경우가 많습니다.")
+        report.append(f"그렇게 보는 이유: {reason}")
+    else:
+        report.append("시장 포지션: 관련 테마 데이터가 충분하지 않아 업종/사업 기준으로 보수적으로 해석하는 것이 좋습니다.")
 
+    # 최근 이슈는 요약형으로 짧고 명확하게
     if news_items:
         titles = []
         for n in news_items[:3]:
             t = normalize_broken_parentheses(str(n.get("title", "")).replace("-v.daum.net", "").replace("- daum", "").strip())
             if t:
-                titles.append(t if len(t) <= 72 else t[:72].rstrip() + "...")
+                titles.append(t if len(t) <= 68 else t[:68].rstrip() + "...")
         if titles:
-            report.append(f"최근 이슈: {' / '.join(titles)}")
+            report.append(f"최근 이슈 요약: {' / '.join(titles)}")
 
-    report.append("체크포인트: 실적 발표 일정, 고객사 투자, 원가/환율, 동종사 주가 흐름을 같이 보세요.")
-    return report[:8]
+    report.append("체크포인트: 실적 발표 일정, 고객사 투자(CAPEX), 원가/환율, 동종사 밸류에이션 흐름을 함께 확인하세요.")
+    return report[:9]
 
 
 def merge_company_info_lines(summary_lines, detailed_lines, max_lines: int = 7):
     def _norm(s: str) -> str:
         t = str(s or "").strip().lower()
-        t = re.sub(r"^(요약|한줄 요약|무슨 회사인가|핵심사업|주요 제품/서비스|주요 사업 구조|사업구조|체크포인트|최근 이슈|시장에서는 이렇게 봄)\s*:\s*", "", t)
+        t = re.sub(r"^(요약|회사 개요|핵심 사업|핵심사업|사업 상세|주요 제품/서비스|주요 사업 구조|사업 구조|사업구조|체크포인트|최근 이슈|시장에서는 이렇게 봄)\s*:\s*", "", t)
+        t = t.replace("(", " ").replace(")", " ").replace("/", " ").replace("·", " ")
+        t = re.sub(r"[^\w\s가-힣%+-]", " ", t)
         t = re.sub(r"\s+", " ", t)
         return t
 
+    def _token_set(s: str) -> set:
+        toks = [x for x in _norm(s).split(" ") if x and len(x) >= 2]
+        stop = {
+            "회사", "사업", "중심", "관련", "분야", "기준", "확인", "가능", "현재",
+            "주요", "구조", "서비스", "제품", "시장", "체크포인트", "데이터"
+        }
+        return set([t for t in toks if t not in stop])
+
     merged = []
-    seen = []
+    seen_text = []
+    seen_tokens = []
     for line in (summary_lines or []) + (detailed_lines or []):
         raw = str(line or "").strip()
         if not raw:
             continue
         n = _norm(raw)
+        tok = _token_set(raw)
         if len(n) < 8:
             continue
         duplicated = False
-        for existing in seen:
+        for i, existing in enumerate(seen_text):
             if n == existing or n in existing or existing in n:
                 duplicated = True
                 break
+            etok = seen_tokens[i]
+            if tok and etok:
+                inter = len(tok.intersection(etok))
+                union = len(tok.union(etok))
+                jacc = (inter / union) if union else 0.0
+                if jacc >= 0.58 or inter >= 5:
+                    duplicated = True
+                    break
         if duplicated:
             continue
-        seen.append(n)
+        seen_text.append(n)
+        seen_tokens.append(tok)
         merged.append(raw)
         if len(merged) >= max_lines:
             break
@@ -877,14 +924,21 @@ def build_theme_bubble_style(avg_change: float, member_count: int, relative_stre
     rel = min(max(relative_strength, 0.0), 1.0)
     size = 88 + int(rel * 120) + min(max(member_count, 1), 6) * 4
     size = min(max(size, 88), 230)
+    tone = min(max((intensity * 0.42) + (rel * 0.58), 0.0), 1.0)
     if avg_change >= 0:
-        color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
-        bg = f"radial-gradient(circle at 30% 30%, rgba(255,250,250,0.98), rgba(254,202,202,{0.16 + 0.30 * color_intensity:.2f}) 42%, rgba(248,113,113,{0.24 + 0.42 * color_intensity:.2f}) 66%, rgba(220,38,38,{0.28 + 0.62 * color_intensity:.2f}) 100%)"
-        text = "#7f1d1d"
+        alpha = 0.82 + 0.14 * tone
+        bg = (
+            f"linear-gradient(145deg, rgba(255,255,255,0.10) 0%, rgba(248,113,113,{alpha:.2f}) 22%, "
+            f"rgba(225,29,72,{alpha:.2f}) 66%, rgba(127,29,29,{0.76 + tone * 0.16:.2f}) 100%)"
+        )
+        text = "#ffffff"
     else:
-        color_intensity = min(max((intensity * 0.45) + (rel * 0.55), 0.0), 1.0)
-        bg = f"radial-gradient(circle at 30% 30%, rgba(248,251,255,0.98), rgba(191,219,254,{0.16 + 0.28 * color_intensity:.2f}) 42%, rgba(96,165,250,{0.24 + 0.40 * color_intensity:.2f}) 66%, rgba(29,78,216,{0.30 + 0.60 * color_intensity:.2f}) 100%)"
-        text = "#1e3a8a"
+        alpha = 0.82 + 0.14 * tone
+        bg = (
+            f"linear-gradient(145deg, rgba(255,255,255,0.10) 0%, rgba(96,165,250,{alpha:.2f}) 22%, "
+            f"rgba(37,99,235,{alpha:.2f}) 66%, rgba(30,58,138,{0.76 + tone * 0.16:.2f}) 100%)"
+        )
+        text = "#ffffff"
     return size, bg, text
 
 
@@ -894,11 +948,17 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
         return f"<div class='theme-bubble-empty'>{empty_label}</div>"
 
     bubbles = []
-    sorted_rows = sorted(
-        rows,
-        key=lambda x: (abs(float(x.get('avg_change', 0))), int(x.get('member_count', 0))),
-        reverse=True,
-    )[:10]
+    if positive:
+        sorted_rows = sorted(
+            rows,
+            key=lambda x: (float(x.get("avg_change", 0)), int(x.get("member_count", 0))),
+            reverse=True,
+        )[:10]
+    else:
+        sorted_rows = sorted(
+            rows,
+            key=lambda x: (float(x.get("avg_change", 0)), -int(x.get("member_count", 0))),
+        )[:10]
     max_abs_change = max([abs(float(x.get("avg_change", 0))) for x in sorted_rows], default=1.0)
     max_abs_change = max(max_abs_change, 0.1)
     lane_key = "UP" if positive else "DOWN"
@@ -911,10 +971,21 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
         size, bg, text = build_theme_bubble_style(avg_change, member_count, relative_strength)
         if not positive:
             size = max(78, int(size * 0.82))
+        fs_name = max(7, min(16, int(size * 0.13)))
+        fs_change = max(8, min(17, int(size * 0.15)))
+        fs_meta = max(7, min(13, int(size * 0.11)))
+        name_len = len(theme_name.replace(" ", ""))
+        if name_len >= 6:
+            fs_name = max(8, fs_name - 1)
+        if name_len >= 8:
+            fs_name = max(7, fs_name - 1)
+        if name_len >= 9:
+            fs_name = max(7, fs_name - 1)
         sign = "+" if avg_change > 0 else ""
         strength = min(max(abs(avg_change), 0.0), 12.0) / 12.0
-        ring = 1 + int(strength * 3)
-        ring_color = "rgba(185,28,28,0.55)" if avg_change >= 0 else "rgba(30,64,175,0.55)"
+        ring = 1
+        ring_alpha = 0.28 + (0.22 * strength)
+        ring_color = f"rgba(127,29,29,{ring_alpha:.2f})" if avg_change >= 0 else f"rgba(30,58,138,{ring_alpha:.2f})"
         popup_html = ""
         if popup_theme and theme_name == popup_theme:
             popup_row = next((x for x in sorted_rows if str(x.get("theme", "")).strip() == popup_theme), None)
@@ -926,9 +997,9 @@ def render_theme_bubble_cluster(rows, positive: bool = True, popup_theme: str = 
             <div class="{item_cls}">
               <div class="theme-bubble-link" data-theme-key="{theme_pick_key}">
                 <div class="theme-bubble" style="--bubble-size:{size}px; background:{bg}; color:{text}; border:{ring}px solid {ring_color};">
-                  <div class="theme-bubble-name">{theme_name}</div>
-                  <div class="theme-bubble-change">{sign}{avg_change:.2f}%</div>
-                  <div class="theme-bubble-meta">{member_count}종목</div>
+                  <div class="theme-bubble-name" style="font-size:{fs_name}px !important; line-height:1.14 !important;">{theme_name}</div>
+                  <div class="theme-bubble-change" style="font-size:{fs_change}px !important;">{sign}{avg_change:.2f}%</div>
+                  <div class="theme-bubble-meta" style="font-size:{fs_meta}px !important;">{member_count}종목</div>
                 </div>
               </div>
               {popup_html}
@@ -1039,8 +1110,8 @@ def load_financial_table_cached(symbol: str):
     return get_krx_financial_table(symbol)
 
 
-THEME_MOVER_CACHE_VERSION = "theme-v12"
-MARKET_MOVER_UI_VERSION = "bubble-v19"
+THEME_MOVER_CACHE_VERSION = "theme-v15"
+MARKET_MOVER_UI_VERSION = "bubble-v25"
 MARKET_WIDE_MOVER_CACHE_VERSION = "mover-top100-v1"
 
 
@@ -1073,8 +1144,8 @@ st.markdown(
     .block-container,
     [data-testid="stAppViewContainer"] > .main .block-container {
       max-width: 1420px;
-      padding-top: 2.4rem;
-      padding-bottom: 2rem;
+      padding-top: 1.2rem;
+      padding-bottom: 1rem;
     }
     .hero-shell {
       background: #ffffff;
@@ -1092,7 +1163,7 @@ st.markdown(
     }
     .hero-title {
       font-family: "Pretendard", "Noto Sans KR", sans-serif;
-      font-size: 2.05rem;
+      font-size: 1.78rem;
       font-weight: 800;
       letter-spacing: -0.5px;
       color: #0f1f3d;
@@ -1113,10 +1184,10 @@ st.markdown(
       vertical-align: middle;
     }
     .hero-sub {
-      margin-top: 8px;
-      margin-bottom: 10px;
+      margin-top: 4px;
+      margin-bottom: 6px;
       color: #5b6784;
-      font-size: 1.03rem;
+      font-size: 0.94rem;
       font-weight: 500;
       letter-spacing: -0.1px;
     }
@@ -1302,7 +1373,7 @@ st.markdown(
         linear-gradient(180deg, #fffdfd 0%, #f8fbff 100%);
       border:1px solid #dbe4f0;
       border-radius:22px;
-      padding:18px 18px 20px 18px;
+      padding:12px 12px 12px 12px;
       box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
       position: relative;
       overflow: visible;
@@ -1310,12 +1381,12 @@ st.markdown(
     .theme-bubble-grid {
       display:grid;
       grid-template-columns: 1fr 1fr;
-      gap: 18px;
+      gap: 10px;
     }
     .theme-bubble-lane {
-      min-height: 220px;
+      min-height: 176px;
       border-radius: 20px;
-      padding: 16px;
+      padding: 10px;
       border: 1px solid rgba(219,228,240,0.9);
       background: rgba(255,255,255,0.74);
       display:flex;
@@ -1329,10 +1400,10 @@ st.markdown(
       background: linear-gradient(180deg, rgba(239,246,255,0.96) 0%, rgba(255,255,255,0.82) 100%);
     }
     .theme-bubble-lane-title {
-      font-size: 1rem;
+      font-size: 0.92rem;
       font-weight: 800;
       color: #0f172a;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }
     .theme-bubble-wrap {
       display:flex;
@@ -1340,7 +1411,7 @@ st.markdown(
       align-items:center;
       align-content:flex-start;
       justify-content:flex-start;
-      gap: 12px;
+      gap: 8px;
       flex:1;
     }
     .theme-bubble-link {
@@ -1355,6 +1426,7 @@ st.markdown(
       user-select: none;
       z-index: 1;
     }
+    .theme-bubble-item.instant-active { z-index: 11900; }
     .theme-bubble-item.active-popup { z-index: 12000; }
     .theme-bubble-item.dragging {
       cursor: grabbing;
@@ -1363,17 +1435,30 @@ st.markdown(
     .theme-bubble {
       width: calc(var(--bubble-size, 120px) * var(--bubble-scale));
       height: calc(var(--bubble-size, 120px) * var(--bubble-scale));
+      --bubble-base: calc(var(--bubble-size, 120px) * var(--bubble-scale));
+      --fs-name: clamp(8px, calc(var(--bubble-base) * 0.16), 18px);
+      --fs-change: clamp(8px, calc(var(--bubble-base) * 0.15), 17px);
+      --fs-meta: clamp(7px, calc(var(--bubble-base) * 0.11), 13px);
       border-radius: 999px;
       display:flex;
       flex-direction:column;
       align-items:center;
       justify-content:center;
       text-align:center;
-      padding: 10px;
+      padding: 9px;
       box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.45),
-        0 10px 24px rgba(15, 23, 42, 0.10);
-      transition: transform 120ms ease, box-shadow 120ms ease;
+        inset 0 1px 0 rgba(255,255,255,0.24),
+        inset 0 -14px 22px rgba(15,23,42,0.10),
+        0 14px 24px rgba(15,23,42,0.13),
+        0 1px 0 rgba(255,255,255,0.85);
+      transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease;
+      overflow: hidden;
+      position: relative;
+      isolation: isolate;
+    }
+    .theme-bubble::before,
+    .theme-bubble::after {
+      content: none;
     }
     .theme-member-popup {
       margin-top: 10px;
@@ -1407,32 +1492,45 @@ st.markdown(
     }
     .theme-bubble:hover {
       transform: translateY(-2px);
+      filter: saturate(1.04);
       box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.45),
-        0 14px 30px rgba(15, 23, 42, 0.14);
+        inset 0 1px 0 rgba(255,255,255,0.28),
+        inset 0 -16px 24px rgba(15,23,42,0.12),
+        0 18px 32px rgba(15,23,42,0.16),
+        0 1px 0 rgba(255,255,255,0.9);
     }
     .theme-bubble-name {
       font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
-      font-size: 1.02rem;
-      font-weight: 900;
-      line-height: 1.2;
+      font-size: var(--fs-name);
+      font-weight: 700;
+      line-height: 1.1;
       max-width: 88%;
-      white-space: normal;
-      word-break: break-word;
-      overflow-wrap: anywhere;
-      text-wrap: pretty;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-shadow: 0 1px 2px rgba(15,23,42,0.22);
     }
     .theme-bubble-change {
       font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
-      font-size: 1rem;
-      font-weight: 800;
+      font-size: var(--fs-change);
+      font-weight: 600;
       margin-top: 5px;
+      max-width: 84%;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-shadow: 0 1px 2px rgba(15,23,42,0.20);
     }
     .theme-bubble-meta {
       font-family: "Pretendard Variable", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
-      font-size: 0.74rem;
+      font-size: var(--fs-meta);
       margin-top: 4px;
       opacity: 0.95;
+      max-width: 84%;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-shadow: 0 1px 2px rgba(15,23,42,0.16);
     }
     .theme-bubble-empty {
       color:#64748b;
@@ -1846,8 +1944,6 @@ st.markdown(
       .theme-bubble-grid { grid-template-columns: 1fr; }
       .theme-bubble-lane { min-height: 220px; }
       .theme-mover-grid { grid-template-columns: 1fr; }
-      .theme-bubble-name { font-size: 0.92rem; }
-      .theme-bubble-change { font-size: 0.9rem; }
       .rel-row { flex-wrap:wrap; }
       .rel-main { width:100%; flex-wrap:wrap; }
       .rel-sub { white-space: normal; }
@@ -1879,7 +1975,15 @@ with head_right:
 
 hero_result = _hero_click_bridge(on_go_home_change=lambda: None, isolate_styles=False, key="hero-click-bridge")
 _copy_shortcut_bridge(isolate_styles=False, key="copy-shortcut-bridge")
-if getattr(hero_result, "go_home", None):
+if getattr(hero_result, "go_home_reload", None):
+    st.markdown(
+        """
+        <script>
+          window.location.reload();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
     st.session_state["query_input"] = ""
     st.session_state["auto_search"] = False
     st.session_state["pending_query"] = None
@@ -1971,7 +2075,7 @@ if not effective_run and not st.session_state.get("last_match"):
                     unsafe_allow_html=True,
                 )
                 if top_risers:
-                    with st.container(border=False, key="mover-list-up"):
+                    with st.container(height=192, border=False, key="mover-list-up"):
                         display_risers = top_risers[:100]
                         for row_idx, pair in enumerate(chunked_rows(display_risers, 2)):
                             cols = st.columns(2, vertical_alignment="center", gap="small")
@@ -2000,7 +2104,7 @@ if not effective_run and not st.session_state.get("last_match"):
                     unsafe_allow_html=True,
                 )
                 if top_fallers:
-                    with st.container(border=False, key="mover-list-down"):
+                    with st.container(height=192, border=False, key="mover-list-down"):
                         display_fallers = top_fallers[:100]
                         for row_idx, pair in enumerate(chunked_rows(display_fallers, 2)):
                             cols = st.columns(2, vertical_alignment="center", gap="small")
@@ -2124,7 +2228,7 @@ if effective_run or st.session_state.get("last_match"):
                         related,
                         snapshot,
                     )
-                    merged_lines = merge_company_info_lines(summary_lines, detailed_lines, max_lines=7)
+                    merged_lines = merge_company_info_lines(summary_lines, detailed_lines, max_lines=9)
                     for line in merged_lines:
                         st.write(f"- {line}")
 

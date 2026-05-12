@@ -993,6 +993,37 @@ def has_business_theme_alignment(theme: str, theme_data: Dict[str, Any], company
     return any(token.lower() in company_lower for token in required)
 
 
+def is_financial_like_company(company_text: str) -> bool:
+    t = to_text(company_text).lower()
+    keys = ["금융", "지주", "보험", "증권", "은행", "카드", "캐피탈", "자산운용", "리츠"]
+    return any(k in t for k in keys)
+
+
+def is_theme_compatible_with_company(theme: str, company_text: str) -> bool:
+    theme_name = normalize_theme_label(theme)
+    if not theme_name:
+        return False
+    if not is_financial_like_company(company_text):
+        return True
+    # 금융/지주 계열에서 자주 발생하는 오탐 테마 차단
+    blocked_for_financial = ["게임", "엔터", "nft", "메타버스", "인터넷플랫폼", "콘텐츠"]
+    low = theme_name.lower()
+    return not any(tok in low for tok in blocked_for_financial)
+
+
+def ensure_financial_theme(company_text: str, themes: List[str]) -> List[str]:
+    out = [normalize_theme_label(t) for t in (themes or []) if normalize_theme_label(t)]
+    if is_financial_like_company(company_text):
+        if "금융" not in out:
+            out.insert(0, "금융")
+    # dedupe
+    dedup = []
+    for t in out:
+        if t and t not in dedup:
+            dedup.append(t)
+    return dedup
+
+
 def classify_theme_origin(theme_data: Dict[str, Any]) -> str:
     core_hits = theme_data.get("core_hits", []) or []
     mapped = bool(theme_data.get("mapped"))
@@ -1190,7 +1221,9 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
         theme
         for theme in select_focus_themes(base_score_map)
         if has_business_theme_alignment(theme, base_score_map.get(theme, {}), base_text)
+        and is_theme_compatible_with_company(theme, base_text)
     ]
+    base_focus_themes = ensure_financial_theme(base_text, base_focus_themes)
     # If the base company text explicitly contains key subtheme tokens, keep that subtheme in focus.
     forced_specific_themes: List[str] = []
     base_text_lower = to_text(base_text).lower()
@@ -1236,7 +1269,9 @@ def get_related_stocks(match: Dict[str, Any], limit: int = 8) -> List[Dict[str, 
                 theme
                 for theme in select_focus_themes(cand_score_map)
                 if has_business_theme_alignment(theme, cand_score_map.get(theme, {}), candidate_text)
+                and is_theme_compatible_with_company(theme, candidate_text)
             ]
+            cand_focus_themes = ensure_financial_theme(candidate_text, cand_focus_themes)
             overlap = sorted(set(base_focus_themes).intersection(set(cand_focus_themes)))
             cand_tokens = set(
                 tokenize_kr_text(" ".join([to_text(name), to_text(industry), to_text(products), to_text(sector)]))
@@ -1555,11 +1590,15 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
             theme_name = normalize_theme_label(raw_theme)
             if theme_name and theme_name not in normalized_mapped:
                 normalized_mapped.append(theme_name)
+        normalized_mapped = [t for t in normalized_mapped if is_theme_compatible_with_company(t, business_text)]
+        normalized_mapped = ensure_financial_theme(business_text, normalized_mapped)
         focus_themes = [
             normalize_theme_label(theme)
             for theme in select_focus_themes(score_map)
             if has_business_theme_alignment(theme, score_map.get(theme, {}), business_text)
+            and is_theme_compatible_with_company(theme, business_text)
         ]
+        focus_themes = ensure_financial_theme(business_text, focus_themes)
         theme_candidates: List[str] = []
         for theme in focus_themes:
             theme_name = normalize_theme_label(theme)
@@ -1585,7 +1624,11 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
         for theme, members in theme_groups.items():
             if not members:
                 continue
-            ordered_members = sorted(members, key=lambda x: x["change_pct"], reverse=True)
+            ordered_members = sorted(
+                members,
+                key=lambda x: x["change_pct"],
+                reverse=is_up,
+            )
             avg_change = sum(x["change_pct"] for x in ordered_members) / len(ordered_members)
             rising_count = len([x for x in ordered_members if x["change_pct"] > 0])
             rows.append(
@@ -1619,18 +1662,21 @@ def get_today_theme_movers(limit_themes: int = 30, members_per_theme: int = 12) 
                 code = to_text(m.get("symbol")).strip()
                 if not code:
                     continue
+                mover_business_text = to_text(m.get("name", ""))
                 mapped = [normalize_theme_label(x) for x in theme_map.get(code, []) if normalize_theme_label(x)]
                 if not mapped:
                     profile = get_krx_profile_by_code(code)
-                    business_text = " ".join(
+                    mover_business_text = " ".join(
                         [
                             to_text(m.get("name", "")),
                             to_text(profile.get("industry", "")),
                             to_text(profile.get("products", "")),
                         ]
                     )
-                    inferred = [normalize_theme_label(x) for x in infer_themes_from_text(business_text)]
+                    inferred = [normalize_theme_label(x) for x in infer_themes_from_text(mover_business_text)]
                     mapped = [x for x in inferred if x]
+                mapped = [x for x in mapped if is_theme_compatible_with_company(x, mover_business_text)]
+                mapped = ensure_financial_theme(mover_business_text, mapped)
                 if not mapped:
                     continue
                 item = {
