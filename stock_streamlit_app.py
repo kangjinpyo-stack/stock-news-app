@@ -527,39 +527,57 @@ def _clean_description_sentences(name: str, desc: str, limit: int = 3) -> list[s
     return sentences
 
 
+def _plain_sentence(text: str, max_len: int = 88) -> str:
+    s = normalize_broken_parentheses(str(text or ""))
+    if not s:
+        return ""
+    s = s.replace("동사는", "").replace("당사는", "")
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    if "," in s:
+        s = s.split(",", 1)[0].strip()
+    if "이며" in s and len(s) > max_len:
+        s = s.split("이며", 1)[0].strip()
+    if len(s) > max_len:
+        s = s[:max_len].rstrip() + "..."
+    if s and not s.endswith("."):
+        s += "."
+    return s
+
+
 def build_company_profile_block(name, industry, products, desc):
     industry_text = normalize_broken_parentheses(industry if industry and industry != "N/A" else "업종 정보 확인 필요")
-    core_business = infer_core_business_labels(industry, products, desc)
+    core_business = normalize_broken_parentheses(infer_core_business_labels(industry, products, desc))
     if not core_business or core_business in {"-", "N/A", "확인 필요"}:
-        core_business = clean_products_text(products, industry, desc)
-    core_business = normalize_broken_parentheses(core_business)
+        core_business = normalize_broken_parentheses(clean_products_text(products, industry, desc))
 
     product_items = _split_core_items(products, limit=4)
-    desc_lines = _clean_description_sentences(name, desc, limit=3)
-    core_items = _split_core_items(core_business, limit=3)
+    core_items = _split_core_items(core_business, limit=4)
+    desc_lines = _clean_description_sentences(name, desc, limit=4)
 
-    head = desc_lines[0] if desc_lines else f"{name}은(는) {industry_text} 분야에서 사업하는 회사입니다."
-    if len(head) > 150:
-        head = head[:150].rstrip() + "..."
+    if desc_lines:
+        head = _plain_sentence(desc_lines[0], max_len=92)
+    else:
+        head = f"{name}은(는) {industry_text} 중심의 사업을 하는 회사입니다."
 
     if product_items:
-        product_line = "· ".join(product_items[:3])
+        product_line = " · ".join(product_items[:4])
     elif core_items:
-        product_line = "· ".join(core_items[:3])
+        product_line = " · ".join(core_items[:4])
     else:
         product_line = "주요 제품/사업 정보 확인 필요"
 
-    second = desc_lines[1] if len(desc_lines) >= 2 else f"핵심 사업은 {core_business}이고, 이 사업의 수요가 실적에 큰 영향을 줍니다."
-    third = desc_lines[2] if len(desc_lines) >= 3 else f"볼 포인트는 {industry_text} 업황, 고객사 투자, 원가와 환율 변화입니다."
+    if len(desc_lines) >= 2:
+        business_line = _plain_sentence(desc_lines[1], max_len=92)
+    else:
+        business_line = f"주요 사업축은 {core_business}이며, 이 부문 실적이 주가에 큰 영향을 줍니다."
+    point_line = f"핵심 체크포인트는 {industry_text} 업황, 고객사 투자, 원가/환율 변화입니다."
 
-    lines = [
-        f"요약: {head}",
-        f"핵심사업: {core_business}",
-        f"주요 제품/서비스: {product_line}",
-        f"사업구조: {second}",
-        f"체크포인트: {third}",
+    return [
+        f"한눈에 보기: {head}",
+        f"무엇을 파는 회사인가: {product_line}",
+        f"어디서 돈을 버는가: {business_line}",
+        f"볼 포인트: {point_line}",
     ]
-    return lines[:3]
 
 
 def build_company_detailed_report(name, industry, products, desc, news_items, related, snapshot):
@@ -569,67 +587,45 @@ def build_company_detailed_report(name, industry, products, desc, news_items, re
     desc_lines = _clean_description_sentences(name, desc, limit=5)
 
     report = []
-    if desc_lines:
-        report.append(f"회사 개요: {desc_lines[0]}")
-    else:
-        report.append(f"회사 개요: {name}은(는) {industry_text} 분야에서 사업하는 회사입니다.")
-    if len(desc_lines) >= 2:
-        report.append(f"사업 상세: {desc_lines[1]}")
-    else:
-        report.append(f"사업 상세: {core_business} 중심이며, 해당 분야 수요와 고객사 투자 집행이 실적에 영향을 줍니다.")
     if len(desc_lines) >= 3:
-        report.append(f"사업 구조: {desc_lines[2]}")
-    else:
-        p_items = _split_core_items(products, limit=5)
-        if p_items:
-            left = " · ".join(p_items[:3])
-            right = " · ".join(p_items[3:5]) if len(p_items) > 3 else ""
-            if right:
-                report.append(
-                    f"사업 구조: 매출은 `{left}` 축에서 발생하고, `{right}` 영역으로 확장되는 구조입니다. "
-                    f"업황/고객사 투자에 따라 품목별 비중과 수익성이 달라질 수 있습니다."
-                )
-            else:
-                report.append(
-                    f"사업 구조: 매출은 `{left}` 중심이며, 고객사 투자 사이클과 업황 변화에 따라 실적 변동성이 커질 수 있습니다."
-                )
-        else:
-            report.append(
-                f"사업 구조: {core_business} 중심의 단일/집중 구조로 보이며, 수요 강도와 원가(원재료·환율)가 수익성에 직접 영향을 줍니다."
-            )
+        report.append(f"회사 이해 포인트: {_plain_sentence(desc_lines[2], max_len=92)}")
 
     if product_items:
-        report.append(f"주요 제품/서비스: {' · '.join(product_items[:5])}")
-    else:
-        report.append(f"주요 제품/서비스: {core_business if core_business else '추가 확인 필요'}")
+        report.append(f"대표 제품/서비스: {' · '.join(product_items[:5])}")
+    elif core_business:
+        report.append(f"대표 제품/서비스: {core_business}")
 
-    # 읽기 쉬운 투자 관점 문장(설명형)
     if related:
         top_theme = normalize_broken_parentheses(str(related[0].get("matched_themes") or "연관 테마 확인 필요"))
         reason = normalize_broken_parentheses(str(related[0].get("theme_reason") or related[0].get("matched_keywords") or "사업 키워드 중첩"))
-        report.append(f"시장 포지션: 현재 시장에서는 `{top_theme}` 축으로 함께 움직이는 종목으로 보는 경우가 많습니다.")
-        report.append(f"그렇게 보는 이유: {reason}")
-    else:
-        report.append("시장 포지션: 관련 테마 데이터가 충분하지 않아 업종/사업 기준으로 보수적으로 해석하는 것이 좋습니다.")
+        if ":" in reason:
+            reason = reason.split(":", 1)[-1].strip()
+        if len(reason) > 54:
+            reason = reason[:54].rstrip() + "..."
+        report.append(f"시장에서 묶이는 테마: {top_theme}")
+        report.append(f"테마 근거: {reason}")
 
-    # 최근 이슈는 요약형으로 짧고 명확하게
     if news_items:
         titles = []
-        for n in news_items[:3]:
+        for n in news_items[:1]:
             t = normalize_broken_parentheses(str(n.get("title", "")).replace("-v.daum.net", "").replace("- daum", "").strip())
             if t:
-                titles.append(t if len(t) <= 68 else t[:68].rstrip() + "...")
+                titles.append(t if len(t) <= 52 else t[:52].rstrip() + "...")
         if titles:
-            report.append(f"최근 이슈 요약: {' / '.join(titles)}")
+            report.append(f"최근 이슈: {' / '.join(titles)}")
 
-    report.append("체크포인트: 실적 발표 일정, 고객사 투자(CAPEX), 원가/환율, 동종사 밸류에이션 흐름을 함께 확인하세요.")
-    return report[:9]
+    report.append("확인하면 좋은 항목: 실적 발표 일정, 고객사 투자(CAPEX), 원가/환율, 동종사 밸류에이션")
+    return report[:5]
 
 
 def merge_company_info_lines(summary_lines, detailed_lines, max_lines: int = 7):
     def _norm(s: str) -> str:
         t = str(s or "").strip().lower()
-        t = re.sub(r"^(요약|회사 개요|핵심 사업|핵심사업|사업 상세|주요 제품/서비스|주요 사업 구조|사업 구조|사업구조|체크포인트|최근 이슈|시장에서는 이렇게 봄)\s*:\s*", "", t)
+        t = re.sub(
+            r"^(요약|회사 개요|핵심 사업|핵심사업|사업 상세|주요 제품/서비스|주요 사업 구조|사업 구조|사업구조|체크포인트|최근 이슈|시장에서는 이렇게 봄|한눈에 보기|무엇을 파는 회사인가|어디서 돈을 버는가|볼 포인트|회사 이해 포인트|대표 제품/서비스|시장에서 묶이는 테마|테마 근거|확인하면 좋은 항목)\s*:\s*",
+            "",
+            t,
+        )
         t = t.replace("(", " ").replace(")", " ").replace("/", " ").replace("·", " ")
         t = re.sub(r"[^\w\s가-힣%+-]", " ", t)
         t = re.sub(r"\s+", " ", t)
